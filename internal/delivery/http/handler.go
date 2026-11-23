@@ -548,6 +548,96 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	// Step 0: Check if the video has an embedded Soft-Subtitle stream (.mkv / .mp4 softsub).
+	// - If the softsub is already in Japanese (contains Hiragana/Katakana/Kanji), we can stream it directly OR use it!
+	// - If the softsub is in Bahasa Indonesia / English, we load its timestamps so every Japanese sentence
+	//   transcribed from the audio gets paired with the official Indonesian softsub translation!
+	tmpSrt := filepath.Join(uploadsDir, fmt.Sprintf("%s.%d_%d.softsub.srt", mediaFilename, startSec, durationSec))
+	defer os.Remove(tmpSrt)
+
+	var indoSoftsubCues []domain.MediaCue
+	var jpSoftsubCues []domain.MediaCue
+
+	ffSubArgs := []string{"-y"}
+	if startSec > 0 {
+		ffSubArgs = append(ffSubArgs, "-ss", strconv.Itoa(startSec))
+	}
+	ffSubArgs = append(ffSubArgs, "-i", videoPath)
+	if durationSec > 0 {
+		ffSubArgs = append(ffSubArgs, "-t", strconv.Itoa(durationSec))
+	}
+	ffSubArgs = append(ffSubArgs, "-map", "0:s:0", "-f", "srt", tmpSrt)
+
+	if err := exec.CommandContext(ctx, "ffmpeg", ffSubArgs...).Run(); err == nil {
+		if b, err := os.ReadFile(tmpSrt); err == nil && len(strings.TrimSpace(string(b))) > 10 {
+			parsedSoftsubs := h.MiningUC.ParseMediaText(string(b), "srt")
+			offsetMs := int64(startSec * 1000)
+			for i := range parsedSoftsubs {
+				parsedSoftsubs[i].StartTimeMs += offsetMs
+				parsedSoftsubs[i].EndTimeMs += offsetMs
+				parsedSoftsubs[i].TimestampLabel = h.MiningUC.FormatTimestampRange(parsedSoftsubs[i].StartTimeMs, parsedSoftsubs[i].EndTimeMs)
+				if containsJapaneseScript(parsedSoftsubs[i].Sentence) {
+					jpSoftsubCues = append(jpSoftsubCues, parsedSoftsubs[i])
+				} else {
+					indoSoftsubCues = append(indoSoftsubCues, parsedSoftsubs[i])
+				}
+			}
+		}
+	}
+
+	// If embedded softsub is ALREADY in Japanese, stream all Japanese softsub cues immediately in <1 second and finish cleanly!
+	if len(jpSoftsubCues) > 0 {
+		sendSSE(map[string]interface{}{
+			"type":     "status",
+			"stage":    "softsub_jp",
+			"progress": 30,
+			"message":  fmt.Sprintf("Ditemukan Softsub Bahasa Jepang bawaan video (%d kalimat)! Memproses kosakata OpenJLPT...", len(jpSoftsubCues)),
+		})
+		var srtBlocks []string
+		for i, cue := range jpSoftsubCues {
+			cue.Index = i + 1
+			if cue.Translation == "" && h.TranslateUC != nil {
+				cue.Translation = h.TranslateUC.TranslateJAtoID(cue.Sentence)
+			}
+			cue.ClipAudioURL = fmt.Sprintf(
+				"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
+				url.QueryEscape(mediaFilename),
+				cue.StartTimeMs,
+				cue.EndTimeMs,
+			)
+			srtBlock := fmt.Sprintf("%d\n%s\n%s", cue.Index, cue.TimestampLabel, cue.Sentence)
+			srtBlocks = append(srtBlocks, srtBlock)
+			pct := 30 + ((i+1)*68)/len(jpSoftsubCues)
+			sendSSE(map[string]interface{}{
+				"type":      "segment",
+				"index":     cue.Index,
+				"progress":  pct,
+				"sentence":  cue.Sentence,
+				"srt_block": srtBlock,
+				"cue":       cue,
+				"message":   fmt.Sprintf("Memuat softsub Jepang #%d/%d...", cue.Index, len(jpSoftsubCues)),
+			})
+		}
+		sendSSE(map[string]interface{}{
+			"type":           "done",
+			"progress":       100,
+			"total_segments": len(jpSoftsubCues),
+			"no_speech":      false,
+			"srt":            strings.Join(srtBlocks, "\n\n"),
+			"message":        fmt.Sprintf("Selesai! %d kalimat Softsub Bahasa Jepang berhasil dimuat.", len(jpSoftsubCues)),
+		})
+		return
+	}
+
+	if len(indoSoftsubCues) > 0 {
+		sendSSE(map[string]interface{}{
+			"type":     "status",
+			"stage":    "softsub_id",
+			"progress": 6,
+			"message":  fmt.Sprintf("Terdeteksi Softsub Indonesia (%d baris). Menggabungkan dengan AI Faster-Whisper untuk mengekstrak suara Jepang aslinya...", len(indoSoftsubCues)),
+		})
+	}
+
 	// Step 1: Extract 16kHz mono WAV for the target range using FFmpeg
 	rangeDesc := "Full Video"
 	if durationSec > 0 {
@@ -619,6 +709,9 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 	buf := make([]byte, 0, 256*1024)
 	scanner.Buffer(buf, 1024*1024)
 
+	sentDone := false
+	segmentCount := 0
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -630,22 +723,32 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 		}
 
 		evType, _ := raw["type"].(string)
-		if evType == "segment" {
+		if evType == "done" {
+			sentDone = true
+			if segmentCount == 0 {
+				raw["no_speech"] = true
+				raw["message"] = "Selesai dipindai, namun tidak ditemukan dialog Bahasa Jepang pada rentang detik ini (mungkin hanya musik BGM/hening). Ekstraksi dihentikan otomatis agar tidak loop."
+			}
+		} else if evType == "segment" {
+			segmentCount++
 			sentence, _ := raw["sentence"].(string)
 			startMs := int64(0)
 			endMs := int64(0)
-			idx := 1
+			idx := segmentCount
 			if v, ok := raw["start_time_ms"].(float64); ok {
 				startMs = int64(v)
 			}
 			if v, ok := raw["end_time_ms"].(float64); ok {
 				endMs = int64(v)
 			}
-			if v, ok := raw["index"].(float64); ok {
-				idx = int(v)
+
+			// 1. Check if video had an embedded Indonesian softsub matching this timestamp, otherwise auto-translate JA -> ID!
+			translation := findMatchingSoftsubTranslation(indoSoftsubCues, startMs, endMs)
+			if translation == "" && h.TranslateUC != nil {
+				translation = h.TranslateUC.TranslateJAtoID(sentence)
 			}
 
-			// Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
+			// 2. Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
 			matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(sentence)
 			clipURL := fmt.Sprintf(
 				"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
@@ -659,6 +762,7 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				EndTimeMs:      endMs,
 				TimestampLabel: h.MiningUC.FormatTimestampRange(startMs, endMs),
 				Sentence:       sentence,
+				Translation:    translation,
 				ClipAudioURL:   clipURL,
 				MatchedVocab:   matched,
 				N4N3Count:      n4n3Count,
@@ -671,6 +775,52 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 	}
 
 	_ = cmdWhisper.Wait()
+
+	// Anti-Loop Guarantee: Always emit a final "done" SSE event if the worker exited early or found 0 segments
+	if !sentDone {
+		msg := fmt.Sprintf("Selesai! Berhasil mengekstrak %d kalimat Bahasa Jepang.", segmentCount)
+		if segmentCount == 0 {
+			msg = "Tidak ditemukan dialog suara Bahasa Jepang pada rentang detik ini. Ekstraksi dihentikan otomatis agar tidak loop."
+		}
+		sendSSE(map[string]interface{}{
+			"type":           "done",
+			"progress":       100,
+			"total_segments": segmentCount,
+			"no_speech":      segmentCount == 0,
+			"message":        msg,
+		})
+	}
+}
+
+func containsJapaneseScript(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3040 && r <= 0x309F) || (r >= 0x30A0 && r <= 0x30FF) || (r >= 0x4E00 && r <= 0x9FFF) {
+			return true
+		}
+	}
+	return false
+}
+
+func findMatchingSoftsubTranslation(softsubs []domain.MediaCue, startMs, endMs int64) string {
+	if len(softsubs) == 0 {
+		return ""
+	}
+	midMs := (startMs + endMs) / 2
+	for _, sub := range softsubs {
+		// Match if midpoint overlaps or start times are within 1.8s
+		if (midMs >= sub.StartTimeMs-800 && midMs <= sub.EndTimeMs+800) ||
+			(absInt64(startMs-sub.StartTimeMs) <= 1800) {
+			return sub.Sentence
+		}
+	}
+	return ""
+}
+
+func absInt64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // ExtractUploadedVideo handles video file upload (.mp4, .mkv, .webm, .mov, .mp3, .wav),

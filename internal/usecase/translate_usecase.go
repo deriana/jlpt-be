@@ -298,10 +298,38 @@ func (u *TranslateUsecase) saveCache(lowerKey, targetID, provider string) {
 	`, lowerKey, targetID, provider)
 }
 
+// TranslateJAtoID translates a Japanese sentence into Bahasa Indonesia (with SQLite caching)
+// so that raw videos without softsubs still get automatic Indonesian subtitle translations during SSE extraction.
+func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
+	clean := strings.TrimSpace(jaText)
+	if clean == "" {
+		return ""
+	}
+	cacheKey := "ja:" + clean
+	u.mu.RLock()
+	if cached, ok := u.memCache[cacheKey]; ok && cached != "" {
+		u.mu.RUnlock()
+		return cached
+	}
+	u.mu.RUnlock()
+
+	if translated, err := fetchGoogleTranslateGTXWithLang(clean, "ja", "id"); err == nil && translated != "" {
+		u.saveCache(cacheKey, translated, "auto-gtx-ja-id")
+		return translated
+	}
+	return ""
+}
+
 func fetchGoogleTranslateGTX(text string) (string, error) {
+	return fetchGoogleTranslateGTXWithLang(text, "en", "id")
+}
+
+func fetchGoogleTranslateGTXWithLang(text, sourceLang, targetLang string) (string, error) {
 	client := &http.Client{Timeout: 1200 * time.Millisecond}
 	apiURL := fmt.Sprintf(
-		"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=id&dt=t&q=%s",
+		"https://translate.googleapis.com/translate_a/single?client=gtx&sl=%s&tl=%s&dt=t&q=%s",
+		url.QueryEscape(sourceLang),
+		url.QueryEscape(targetLang),
 		url.QueryEscape(text),
 	)
 	resp, err := client.Get(apiURL)
