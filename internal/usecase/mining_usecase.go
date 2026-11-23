@@ -1,7 +1,14 @@
 package usecase
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -450,6 +457,147 @@ func (u *MiningUsecase) SaveMinedSentenceToDeck(userID int64, req *domain.MinedS
 	_ = u.SRSRepo.CreateCard(card)
 
 	return req, card, nil
+}
+
+type VideoExtractionResult struct {
+	MediaFilename    string            `json:"media_filename"`
+	MediaTitle       string            `json:"media_title"`
+	MediaURL         string            `json:"media_url"`
+	ExtractionMethod string            `json:"extraction_method"`
+	SRTContent       string            `json:"srt_content"`
+	Cues             []domain.MediaCue `json:"cues"`
+}
+
+// ExtractVideoToTimestampCues extracts per-sentence timestamps and subtitles from an uploaded video/audio file:
+// 1. Tries extracting an embedded subtitle track (.mkv/.mp4 softsubs) via ffmpeg (<1s).
+// 2. If no embedded subtitle exists, extracts 16kHz mono WAV via ffmpeg and transcribes Japanese sentences
+//    with exact timestamps using local offline Faster-Whisper (/home/hideri/coding/Open-LLM-VTuber/models/whisper_base).
+// 3. Attaches a direct original-video audio slice URL (ClipAudioURL) to every sentence cue so study playback uses the ORIGINAL video voice!
+func (u *MiningUsecase) ExtractVideoToTimestampCues(savedVideoPath string, mediaFilename string, title string) (*VideoExtractionResult, error) {
+	uploadsDir := filepath.Dir(savedVideoPath)
+	_ = os.MkdirAll(filepath.Join(uploadsDir, "clips"), 0755)
+
+	tmpSrt := filepath.Join(uploadsDir, mediaFilename+".extracted.srt")
+	defer os.Remove(tmpSrt)
+
+	var srtContent string
+	extractionMethod := "embedded-subtitle-stream"
+
+	// 1. Check for embedded soft-subtitle track in video container (.mkv / .mp4)
+	cmdSub := exec.Command("ffmpeg", "-y", "-i", savedVideoPath, "-map", "0:s:0", "-f", "srt", tmpSrt)
+	if err := cmdSub.Run(); err == nil {
+		if b, err := os.ReadFile(tmpSrt); err == nil && len(strings.TrimSpace(string(b))) > 10 {
+			srtContent = string(b)
+		}
+	}
+
+	// 2. If no embedded subtitle track, run local Faster-Whisper ASR on the video's original audio track
+	if strings.TrimSpace(srtContent) == "" {
+		extractionMethod = "faster-whisper-offline-asr"
+		tmpWav := filepath.Join(uploadsDir, mediaFilename+".16k.wav")
+		defer os.Remove(tmpWav)
+
+		cmdAudio := exec.Command("ffmpeg", "-y", "-i", savedVideoPath, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", tmpWav)
+		if out, err := cmdAudio.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("failed to extract audio track from video via ffmpeg: %v (%s)", err, string(out))
+		}
+
+		pythonBin := "/home/hideri/coding/Open-LLM-VTuber/.venv/bin/python3"
+		if _, err := os.Stat(pythonBin); err != nil {
+			pythonBin = "python3"
+		}
+		scriptPath, _ := filepath.Abs("./scripts/whisper_extract.py")
+		cmdWhisper := exec.Command(pythonBin, scriptPath, "--input", tmpWav, "--lang", "ja")
+		wOut, err := cmdWhisper.Output()
+		if err != nil {
+			return nil, fmt.Errorf("faster-whisper transcription failed: %w", err)
+		}
+
+		var whisperRes struct {
+			SRT   string `json:"srt"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(wOut, &whisperRes); err == nil && whisperRes.SRT != "" {
+			srtContent = whisperRes.SRT
+		} else if whisperRes.Error != "" {
+			return nil, fmt.Errorf("whisper error: %s", whisperRes.Error)
+		}
+	}
+
+	cues := u.ParseMediaText(srtContent, "srt")
+	for i := range cues {
+		cues[i].ClipAudioURL = fmt.Sprintf(
+			"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
+			url.QueryEscape(mediaFilename),
+			cues[i].StartTimeMs,
+			cues[i].EndTimeMs,
+		)
+	}
+
+	if title == "" {
+		title = mediaFilename
+	}
+
+	return &VideoExtractionResult{
+		MediaFilename:    mediaFilename,
+		MediaTitle:       title,
+		MediaURL:         "/api/v1/mining/media/" + mediaFilename,
+		ExtractionMethod: extractionMethod,
+		SRTContent:       srtContent,
+		Cues:             cues,
+	}, nil
+}
+
+// SliceOriginalAudioClip uses FFmpeg to cut the exact [startMs, endMs] audio segment from the uploaded video
+// so that flashcards and sentence reviews play the 100% ORIGINAL voice from the video (not VOICEVOX).
+func (u *MiningUsecase) SliceOriginalAudioClip(uploadsDir string, mediaFilename string, startMs int64, endMs int64) (string, string, error) {
+	cleanMedia := filepath.Base(mediaFilename)
+	sourceVideoPath := filepath.Join(uploadsDir, cleanMedia)
+	if _, err := os.Stat(sourceVideoPath); err != nil {
+		return "", "", fmt.Errorf("source media file not found: %s", cleanMedia)
+	}
+
+	if endMs <= startMs {
+		endMs = startMs + 3000
+	}
+	// Add 120ms padding before/after so consonant starts/ends aren't clipped too tightly
+	padStartMs := startMs - 100
+	if padStartMs < 0 {
+		padStartMs = 0
+	}
+	padEndMs := endMs + 180
+
+	hashInput := fmt.Sprintf("%s|%d|%d", cleanMedia, padStartMs, padEndMs)
+	h := sha1.Sum([]byte(hashInput))
+	clipFilename := fmt.Sprintf("clip_%s_%d_%d.wav", hex.EncodeToString(h[:])[:10], startMs, endMs)
+	clipsDir := filepath.Join(uploadsDir, "clips")
+	_ = os.MkdirAll(clipsDir, 0755)
+	clipFullPath := filepath.Join(clipsDir, clipFilename)
+	publicURL := "/api/v1/mining/media/clips/" + clipFilename
+
+	if info, err := os.Stat(clipFullPath); err == nil && info.Size() > 44 {
+		return clipFullPath, publicURL, nil
+	}
+
+	startSec := fmt.Sprintf("%.3f", float64(padStartMs)/1000.0)
+	durationSec := fmt.Sprintf("%.3f", float64(padEndMs-padStartMs)/1000.0)
+
+	cmd := exec.Command(
+		"ffmpeg", "-y",
+		"-ss", startSec,
+		"-i", sourceVideoPath,
+		"-t", durationSec,
+		"-vn",
+		"-acodec", "pcm_s16le",
+		"-ar", "24000",
+		"-ac", "1",
+		clipFullPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("ffmpeg clip slice failed: %v (%s)", err, string(out))
+	}
+
+	return clipFullPath, publicURL, nil
 }
 
 func hmsToMs(hStr, mStr, sStr, msStr string) int64 {

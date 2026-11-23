@@ -34,12 +34,15 @@ func NewRouter(h *Handler) *gin.Engine {
 		api.POST("/srs/cards", h.CreateCard)
 		api.POST("/srs/review", h.SubmitReview)
 
-		// Anime & Music Sentence Mining + OpenJLPT Matcher
+		// Anime & Music Sentence Mining + OpenJLPT Matcher + Video Subtitle/Audio Extractor
 		api.GET("/mining/presets", h.GetMiningPresets)
 		api.POST("/mining/parse", h.ParseMediaScript)
 		api.POST("/mining/match", h.MatchSentenceVocab)
 		api.GET("/mining/sentences", h.ListMinedSentences)
 		api.POST("/mining/sentences", h.SaveMinedSentence)
+		api.POST("/mining/extract-video", h.ExtractUploadedVideo)
+		api.GET("/mining/clip", h.ServeVideoAudioClip)
+		api.GET("/mining/media/*filepath", h.ServeUploadedMedia)
 
 		// OpenJLPT Offline Dictionary & Scraper Sync
 		api.GET("/jlpt/vocab", h.SearchVocab)

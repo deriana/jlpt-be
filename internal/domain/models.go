@@ -166,6 +166,7 @@ type MediaCue struct {
 	TimestampLabel string              `json:"timestamp_label"`
 	Sentence       string              `json:"sentence"`
 	Translation    string              `json:"translation,omitempty"`
+	ClipAudioURL   string              `json:"clip_audio_url,omitempty"`
 	MatchedVocab   []MatchedVocabToken `json:"matched_vocab"`
 	N4N3Count      int                 `json:"n4_n3_count"`
 	CoverageRate   float64             `json:"coverage_rate"`

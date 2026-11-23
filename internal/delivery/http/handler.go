@@ -1,9 +1,12 @@
 package http
 
 import (
+	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"jlptmaster/backend/internal/config"
@@ -345,6 +348,7 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 	var req struct {
 		MediaTitle     string `json:"media_title"`
 		MediaType      string `json:"media_type"`
+		MediaFilename  string `json:"media_filename"`
 		Sentence       string `json:"sentence" binding:"required"`
 		Reading        string `json:"reading"`
 		Translation    string `json:"translation"`
@@ -360,11 +364,20 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		return
 	}
 	if req.MediaTitle == "" {
-		req.MediaTitle = "Anime / Song Immersion Clip"
+		req.MediaTitle = "Anime / Video Immersion Clip"
 	}
 	if req.MediaType == "" {
 		req.MediaType = "anime"
 	}
+
+	// If mined from an uploaded video file, slice the ORIGINAL video voice clip into a permanent WAV file for SRS flashcards!
+	audioURL := req.AudioURL
+	if req.MediaFilename != "" {
+		if _, publicURL, err := h.MiningUC.SliceOriginalAudioClip("./data/media_uploads", req.MediaFilename, req.StartTimeMs, req.EndTimeMs); err == nil {
+			audioURL = publicURL
+		}
+	}
+
 	mined := &domain.MinedSentence{
 		MediaTitle:     req.MediaTitle,
 		MediaType:      req.MediaType,
@@ -374,7 +387,7 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		StartTimeMs:    req.StartTimeMs,
 		EndTimeMs:      req.EndTimeMs,
 		TimestampLabel: req.TimestampLabel,
-		AudioURL:       req.AudioURL,
+		AudioURL:       audioURL,
 	}
 	savedMined, card, err := h.MiningUC.SaveMinedSentenceToDeck(getUserID(c), mined, req.TargetWord, req.DeckID)
 	if err != nil {
@@ -385,6 +398,76 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		"mined_sentence": savedMined,
 		"flashcard":      card,
 	})
+}
+
+// ExtractUploadedVideo handles video file upload (.mp4, .mkv, .webm, .mov, .mp3, .wav),
+// extracts per-sentence timestamps & subtitles via FFmpeg + Local Offline Faster-Whisper,
+// and links every sentence to the ORIGINAL video's voice audio slice!
+func (h *Handler) ExtractUploadedVideo(c *gin.Context) {
+	file, err := c.FormFile("video")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing video file in form data"})
+		return
+	}
+
+	uploadsDir := "./data/media_uploads"
+	_ = os.MkdirAll(uploadsDir, 0755)
+
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if ext == "" {
+		ext = ".mp4"
+	}
+	safeName := fmt.Sprintf("video_%d%s", time.Now().UnixNano(), ext)
+	savedPath := filepath.Join(uploadsDir, safeName)
+
+	if err := c.SaveUploadedFile(file, savedPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save uploaded video: " + err.Error()})
+		return
+	}
+
+	title := strings.TrimSpace(c.PostForm("title"))
+	if title == "" {
+		title = strings.TrimSuffix(file.Filename, filepath.Ext(file.Filename))
+	}
+
+	result, err := h.MiningUC.ExtractVideoToTimestampCues(savedPath, safeName, title)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// ServeVideoAudioClip slices and streams the exact [start_ms, end_ms] original voice segment from an uploaded video.
+func (h *Handler) ServeVideoAudioClip(c *gin.Context) {
+	media := c.Query("media")
+	startMs, _ := strconv.ParseInt(c.Query("start_ms"), 10, 64)
+	endMs, _ := strconv.ParseInt(c.Query("end_ms"), 10, 64)
+	if media == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing media parameter"})
+		return
+	}
+
+	clipPath, _, err := h.MiningUC.SliceOriginalAudioClip("./data/media_uploads", media, startMs, endMs)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Header("Content-Type", "audio/wav")
+	c.Header("Cache-Control", "public, max-age=86400")
+	c.File(clipPath)
+}
+
+// ServeUploadedMedia streams uploaded video files or sliced original audio clips with HTTP Range support.
+func (h *Handler) ServeUploadedMedia(c *gin.Context) {
+	relPath := strings.TrimLeft(filepath.Clean(c.Param("filepath")), "/\\")
+	if strings.Contains(relPath, "..") {
+		c.Status(http.StatusForbidden)
+		return
+	}
+	fullPath := filepath.Join("./data/media_uploads", relPath)
+	c.File(fullPath)
 }
 
 // ==========================================

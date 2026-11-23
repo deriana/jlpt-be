@@ -11,10 +11,10 @@
   "tts": {
     "provider": "voicevox",
     "voicevox_url": "http://127.0.0.1:50021",
-    "default_speaker_id": "3",
-    "speed_scale": 1.0,
-    "pitch_scale": 0.0,
-    "intonation_scale": 1.0,
+    "default_speaker_id": "2",
+    "speed_scale": 1,
+    "pitch_scale": 0,
+    "intonation_scale": 1,
     "cache_dir": "./data/audio_cache"
   },
   "llm": {

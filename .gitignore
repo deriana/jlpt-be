@@ -6,3 +6,4 @@ data/jlptmaster.db-shm
 data/jlptmaster.db-wal
 *.log
 .DS_Store
+data/media_uploads/
