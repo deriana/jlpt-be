@@ -42,6 +42,7 @@ func main() {
 	progressUC := usecase.NewProgressUsecase(db.DB)
 	ttsUC := usecase.NewTTSUsecase(cfg)
 	translateUC := usecase.NewTranslateUsecase(db.DB)
+	translateUC.SetConfig(cfg)
 	tutorUC := usecase.NewTutorUsecase(cfg, tutorRepo, jlptRepo, ttsUC, translateUC)
 
 	// Delivery

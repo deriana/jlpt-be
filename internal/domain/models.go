@@ -160,16 +160,19 @@ type MatchedVocabToken struct {
 }
 
 type MediaCue struct {
-	Index          int                 `json:"index"`
-	StartTimeMs    int64               `json:"start_time_ms"`
-	EndTimeMs      int64               `json:"end_time_ms"`
-	TimestampLabel string              `json:"timestamp_label"`
-	Sentence       string              `json:"sentence"`
-	Translation    string              `json:"translation,omitempty"`
-	ClipAudioURL   string              `json:"clip_audio_url,omitempty"`
-	MatchedVocab   []MatchedVocabToken `json:"matched_vocab"`
-	N4N3Count      int                 `json:"n4_n3_count"`
-	CoverageRate   float64             `json:"coverage_rate"`
+	Index               int                 `json:"index"`
+	StartTimeMs         int64               `json:"start_time_ms"`
+	EndTimeMs           int64               `json:"end_time_ms"`
+	TimestampLabel      string              `json:"timestamp_label"`
+	Sentence            string              `json:"sentence"`
+	Translation         string              `json:"translation,omitempty"`
+	TranslationID       string              `json:"translation_id,omitempty"`
+	TranslationEN       string              `json:"translation_en,omitempty"`
+	TranslationProvider string              `json:"translation_provider,omitempty"`
+	ClipAudioURL        string              `json:"clip_audio_url,omitempty"`
+	MatchedVocab        []MatchedVocabToken `json:"matched_vocab"`
+	N4N3Count           int                 `json:"n4_n3_count"`
+	CoverageRate        float64             `json:"coverage_rate"`
 }
 
 type MediaPreset struct {

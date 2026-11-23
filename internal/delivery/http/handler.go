@@ -587,18 +587,31 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 			"message":  fmt.Sprintf("Ditemukan Softsub Bahasa Jepang bawaan video (%d kalimat dialog bersih)! Memproses kosakata OpenJLPT...", len(jpSoftsubCues)),
 		})
 		var srtBlocks []string
+		prevJpSentence := ""
 		for i, cue := range jpSoftsubCues {
 			cue.Index = i + 1
+			if h.TranslateUC != nil {
+				cue.Sentence = h.TranslateUC.NormalizeJapaneseTranscript(cue.Sentence)
+			}
 			matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(cue.Sentence)
 			cue.MatchedVocab = matched
 			cue.N4N3Count = n4n3Count
 			cue.CoverageRate = coverage
-			if cue.Translation == "" {
-				cue.Translation = findOverlappingSoftsubTranslation(indoSoftsubCues, usedSoftsubs, cue.StartTimeMs, cue.EndTimeMs)
+			softsubID := cue.Translation
+			if softsubID == "" {
+				softsubID = findOverlappingSoftsubTranslation(indoSoftsubCues, usedSoftsubs, cue.StartTimeMs, cue.EndTimeMs)
 			}
-			if cue.Translation == "" && h.TranslateUC != nil {
-				cue.Translation = h.TranslateUC.TranslateJAtoID(cue.Sentence)
+			if h.TranslateUC != nil {
+				trID, trEN, trProv := h.TranslateUC.TranslateTranscriptCueJA(cue.Sentence, prevJpSentence, matched, softsubID)
+				cue.Translation = trID
+				cue.TranslationID = trID
+				cue.TranslationEN = trEN
+				cue.TranslationProvider = trProv
+			} else {
+				cue.Translation = softsubID
+				cue.TranslationID = softsubID
 			}
+			prevJpSentence = cue.Sentence
 			cue.ClipAudioURL = fmt.Sprintf(
 				"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
 				url.QueryEscape(mediaFilename),
@@ -711,6 +724,7 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 
 	sentDone := false
 	segmentCount := 0
+	prevSentence := ""
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -732,6 +746,9 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 		} else if evType == "segment" {
 			segmentCount++
 			sentence, _ := raw["sentence"].(string)
+			if h.TranslateUC != nil {
+				sentence = h.TranslateUC.NormalizeJapaneseTranscript(sentence)
+			}
 			startMs := int64(0)
 			endMs := int64(0)
 			idx := segmentCount
@@ -742,15 +759,19 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				endMs = int64(v)
 			}
 
-			// 1. Match embedded Indonesian softsub by actual time overlap (joining multi-cue spans and preventing swaps),
-			//    or fall back to Google Clients5 Neural Machine Translation (JA -> ID)!
-			translation := findOverlappingSoftsubTranslation(indoSoftsubCues, usedSoftsubs, startMs, endMs)
-			if translation == "" && h.TranslateUC != nil {
-				translation = h.TranslateUC.TranslateJAtoID(sentence)
-			}
-
-			// 2. Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
+			// 1. Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
 			matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(sentence)
+
+			// 2. Match embedded Indonesian softsub (if present) + translate JP -> ID and JP -> EN via Local AI Qwen 2.5 (3B)
+			softsubID := findOverlappingSoftsubTranslation(indoSoftsubCues, usedSoftsubs, startMs, endMs)
+			translationID := softsubID
+			translationEN := ""
+			translationProvider := "softsub"
+			if h.TranslateUC != nil {
+				translationID, translationEN, translationProvider = h.TranslateUC.TranslateTranscriptCueJA(sentence, prevSentence, matched, softsubID)
+			}
+			prevSentence = sentence
+
 			clipURL := fmt.Sprintf(
 				"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
 				url.QueryEscape(mediaFilename),
@@ -758,17 +779,21 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				endMs,
 			)
 			cue := domain.MediaCue{
-				Index:          idx,
-				StartTimeMs:    startMs,
-				EndTimeMs:      endMs,
-				TimestampLabel: h.MiningUC.FormatTimestampRange(startMs, endMs),
-				Sentence:       sentence,
-				Translation:    translation,
-				ClipAudioURL:   clipURL,
-				MatchedVocab:   matched,
-				N4N3Count:      n4n3Count,
-				CoverageRate:   coverage,
+				Index:               idx,
+				StartTimeMs:         startMs,
+				EndTimeMs:           endMs,
+				TimestampLabel:      h.MiningUC.FormatTimestampRange(startMs, endMs),
+				Sentence:            sentence,
+				Translation:         translationID,
+				TranslationID:       translationID,
+				TranslationEN:       translationEN,
+				TranslationProvider: translationProvider,
+				ClipAudioURL:        clipURL,
+				MatchedVocab:        matched,
+				N4N3Count:           n4n3Count,
+				CoverageRate:        coverage,
 			}
+			raw["sentence"] = sentence
 			raw["cue"] = cue
 		}
 

@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"jlptmaster/backend/internal/config"
+	"jlptmaster/backend/internal/domain"
 )
 
 var htmlAndAssTagRegex = regexp.MustCompile(`(?i)<[^>]*>|\{\\[^}]*\}`)
@@ -26,8 +30,15 @@ func StripSubtitleMarkup(s string) string {
 
 type TranslateUsecase struct {
 	DB       *sql.DB
+	Cfg      *config.AppConfig
 	mu       sync.RWMutex
 	memCache map[string]string
+}
+
+func (u *TranslateUsecase) SetConfig(cfg *config.AppConfig) {
+	u.mu.Lock()
+	u.Cfg = cfg
+	u.mu.Unlock()
 }
 
 // Offline English -> Bahasa Indonesia core JLPT N4/N3 dictionary & phrase map
@@ -342,6 +353,13 @@ var animeConversationalJAtoID = map[string]string{
 	"え？":             "Eh?",
 	"えっ?":            "Eh?",
 	"えっ？":            "Eh?",
+	"ん?":             "Hmm?",
+	"ん？":             "Hmm?",
+	"はっ…":            "Hah...",
+	"はぁ…":            "Haa...",
+	"林田君は？":          "Kalau Hayashida-kun (di mana)?",
+	"林田君は?":          "Kalau Hayashida-kun (di mana)?",
+	"帰ったよ":           "Dia sudah pulang.",
 	"お前が浮気相手ってことだよ":  "Dengar, itu artinya kamulah selingkuhannya.",
 	"もう用済みだからな":      "Tapi aku sudah selesai denganmu sekarang (kamu sudah tidak berguna lagi).",
 	"もう用済みだからな…":     "Tapi aku sudah selesai denganmu sekarang (kamu sudah tidak berguna lagi).",
@@ -354,19 +372,64 @@ var animeConversationalJAtoID = map[string]string{
 	"お前の勘違いだよバーカ":    "Itu cuma salah pahammu, bodoh.",
 }
 
+var animeConversationalJAtoEN = map[string]string{
+	"お、お姉さん?来てたんだ":   "Oh, your older sister? Is she visiting?",
+	"お、お姉さん？来てたんだ":   "Oh, your older sister? Is she visiting?",
+	"お…お姉さん?来てたんだ":   "Oh, your older sister? Is she visiting?",
+	"お…お姉さん？来てたんだ":   "Oh, your older sister? Is she visiting?",
+	"お…お姉さんいたんだ":     "Oh... so you have an older sister.",
+	"お姉さん?":          "Your older sister?",
+	"お姉さん？":          "Your older sister?",
+	"カノジョ…":          "My... girlfriend...",
+	"カノジョ":           "My girlfriend.",
+	"彼女…":            "My... girlfriend...",
+	"彼女":             "My girlfriend.",
+	"え?":             "Eh?",
+	"え？":             "Eh?",
+	"えっ?":            "Eh?",
+	"えっ？":            "Eh?",
+	"ん?":             "Hmm?",
+	"ん？":             "Hmm?",
+	"はっ…":            "Gasp...",
+	"はぁ…":            "Sigh...",
+	"林田君は？":          "Where is Hayashida-kun?",
+	"林田君は?":          "Where is Hayashida-kun?",
+	"帰ったよ":           "He went home.",
+	"お前が浮気相手ってことだよ":  "That means you're the affair partner.",
+	"もう用済みだからな":      "Because I have no more use for you now.",
+	"もう用済みだからな…":     "Because I have no more use for you now...",
+	"もう用済みだな":        "You're no longer needed now.",
+	"もう用済み…":         "No longer needed...",
+	"やだ!受ける!":        "No way! That's hilarious!",
+	"やだ！ウケる！":        "No way! That's hilarious!",
+	"やだ、ウケる！":        "No way, that's hilarious!",
+	"やだ、受ける":         "No way, that's hilarious!",
+	"お前の勘違いだよバーカ":    "That's just your misunderstanding, idiot.",
+}
+
 var jaHomophoneNormalizer = []struct {
 	wrong string
 	right string
 }{
 	{"お…お姉さんってたんだ", "お、お姉さん？来てたんだ"},
+	{"お、お姉さん、来てたんだ", "お、お姉さん？来てたんだ"},
+	{"お姉さん、来てたんだ", "お、お姉さん？来てたんだ"},
 	{"お姉さんってたんだ", "お姉さんいたんだ"},
+	{"か、の、じょ。", "彼女…"},
+	{"か、の、じょ", "彼女…"},
 	{"カノジオ", "カノジョ"},
 	{"彼の女", "彼女"},
 	{"うわき合いって", "浮気相手"},
 	{"浮き合いって", "浮気相手"},
 	{"浮気合いって", "浮気相手"},
+	{"上き合いって", "浮気相手"},
 	{"上着相手", "浮気相手"},
 	{"うわきあいて", "浮気相手"},
+	{"は、はやしだくんを?", "林田君は？"},
+	{"はやしだくんを?", "林田君は？"},
+	{"はやしだくん", "林田君"},
+	{"ごお体しルート", "王太子ルート"},
+	{"ナイトを困ると思って", "ないと困ると思って"},
 	{"もう様子見だけだなぁ", "もう用済みだからな"},
 	{"もう様子見だけだな", "もう用済みだからな"},
 	{"もう様子みだけだな", "もう用済みだからな"},
@@ -391,6 +454,8 @@ var jaHomophoneNormalizer = []struct {
 	{"円組", "縁組"},
 	{"全ルート整発", "全ルート制覇"},
 	{"全ルート生破", "全ルート制覇"},
+	{"ほ…ほよしど君を?", "林田君は？"},
+	{"ほよしど君を?", "林田君は？"},
 	{"バーガー", "バーカ"},
 	{"バーカー", "バーカ"},
 	{"鬼もつあつかい", "お荷物扱い"},
@@ -424,12 +489,9 @@ var jaHomophoneNormalizer = []struct {
 // TranslateJAtoID translates a Japanese sentence into clean Bahasa Indonesia (with SQLite caching)
 // using Google Neural Machine Translation (clients5 dict-chrome-ex) and strips any HTML/subtitle markup.
 func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
-	clean := StripSubtitleMarkup(jaText)
+	clean := u.NormalizeJapaneseTranscript(jaText)
 	if clean == "" {
 		return ""
-	}
-	for _, pair := range jaHomophoneNormalizer {
-		clean = strings.ReplaceAll(clean, pair.wrong, pair.right)
 	}
 	if override, ok := animeConversationalJAtoID[clean]; ok {
 		return override
@@ -454,6 +516,279 @@ func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
 		return cleaned
 	}
 	return ""
+}
+
+func (u *TranslateUsecase) NormalizeJapaneseTranscript(jaText string) string {
+	clean := StripSubtitleMarkup(jaText)
+	if clean == "" {
+		return ""
+	}
+	for _, pair := range jaHomophoneNormalizer {
+		clean = strings.ReplaceAll(clean, pair.wrong, pair.right)
+	}
+	return strings.TrimSpace(clean)
+}
+
+// TranslateJAtoEN translates a Japanese sentence into English (with SQLite caching).
+func (u *TranslateUsecase) TranslateJAtoEN(jaText string) string {
+	clean := u.NormalizeJapaneseTranscript(jaText)
+	if clean == "" {
+		return ""
+	}
+	if override, ok := animeConversationalJAtoEN[clean]; ok {
+		return override
+	}
+	cacheKey := "ja_en:" + clean
+	u.mu.RLock()
+	if cached, ok := u.memCache[cacheKey]; ok && cached != "" {
+		u.mu.RUnlock()
+		return StripSubtitleMarkup(cached)
+	}
+	u.mu.RUnlock()
+
+	if translated, err := fetchGoogleClients5Translate(clean, "ja", "en"); err == nil && translated != "" {
+		cleaned := StripSubtitleMarkup(translated)
+		u.saveCache(cacheKey, cleaned, "auto-gclients5-ja-en")
+		return cleaned
+	}
+	if translated, err := fetchGoogleTranslateGTXWithLang(clean, "ja", "en"); err == nil && translated != "" {
+		cleaned := StripSubtitleMarkup(translated)
+		u.saveCache(cacheKey, cleaned, "auto-gtx-ja-en")
+		return cleaned
+	}
+	return ""
+}
+
+var (
+	topicQuestionSuffixRegex = regexp.MustCompile(`^(.{1,12})(君|くん|さん|ちゃん|様|さま|先生)?は[?？。]*$`)
+	leadingListNumberRegex   = regexp.MustCompile(`^\d+[\.\)\:]\s*`)
+)
+
+func lookupConversationalMap(m map[string]string, s string) (string, bool) {
+	if v, ok := m[s]; ok {
+		return v, true
+	}
+	trimmed := strings.TrimRight(s, "。！! ")
+	if v, ok := m[trimmed]; ok {
+		return v, true
+	}
+	noComma := strings.ReplaceAll(trimmed, "、", "")
+	for k, v := range m {
+		kClean := strings.ReplaceAll(strings.TrimRight(k, "。！! "), "、", "")
+		if kClean == noComma {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// TranslateTranscriptCueJA translates a Japanese transcript sentence into BOTH Bahasa Indonesia (JP -> ID)
+// and English (JP -> EN) using the user's Local AI (Qwen 2.5 3B via Ollama) grounded with OpenJLPT vocabulary
+// meanings and surrounding dialogue context (e.g. resolving "林田君は？" -> "帰ったよ" as "Where is Hayashida-kun?" -> "He went home.").
+func (u *TranslateUsecase) TranslateTranscriptCueJA(
+	jaText string,
+	prevJaText string,
+	matchedVocab []domain.MatchedVocabToken,
+	softsubID string,
+) (translationID string, translationEN string, provider string) {
+	clean := u.NormalizeJapaneseTranscript(jaText)
+	if clean == "" {
+		return "", "", ""
+	}
+	cleanPrev := u.NormalizeJapaneseTranscript(prevJaText)
+
+	// 1. Check exact verified conversational anime overrides (ignoring trailing periods/commas)
+	if ovID, ok := lookupConversationalMap(animeConversationalJAtoID, clean); ok {
+		translationID = ovID
+	}
+	if ovEN, ok := lookupConversationalMap(animeConversationalJAtoEN, clean); ok {
+		translationEN = ovEN
+	}
+	if softsubID != "" {
+		translationID = StripSubtitleMarkup(softsubID)
+	}
+
+	// 2. Build targeted semantic notes & context for Qwen 2.5 3B
+	var notes []string
+	if topicQuestionSuffixRegex.MatchString(clean) {
+		notes = append(notes, `Note: "[Name]は？" asks "Where is [Name]? / What about [Name]?", NEVER "How are you, [Name]?".`)
+	}
+	usePrevContext := false
+	if cleanPrev != "" {
+		if strings.HasSuffix(cleanPrev, "?") || strings.HasSuffix(cleanPrev, "？") || len([]rune(clean)) <= 10 {
+			usePrevContext = true
+		}
+		if topicQuestionSuffixRegex.MatchString(cleanPrev) {
+			usePrevContext = true
+			notes = append(notes, `Note: The omitted subject refers to the person asked about in the previous line ("He/She ..."), NOT "I".`)
+		}
+	}
+	if strings.Contains(clean, "浮気相手") {
+		notes = append(notes, `Note: "浮気相手" means "the affair partner / the other woman".`)
+	}
+	if strings.Contains(clean, "用済み") {
+		notes = append(notes, `Note: "もう用済みだからな" means "Because I have no more use for you now."`)
+	}
+	if strings.Contains(clean, "ウケる") || strings.Contains(clean, "受ける") {
+		notes = append(notes, `Note: "やだ、ウケる" is slang meaning "No way, that is hilarious!"`)
+	}
+	if softsubID != "" {
+		notes = append(notes, fmt.Sprintf("Indonesian reference subtitle: %s", softsubID))
+	}
+
+	prevForPrompt := ""
+	if usePrevContext {
+		prevForPrompt = cleanPrev
+	}
+
+	// 3. Translate JP -> EN via Local AI Qwen 2.5 (3B) refining a base NMT draft with dialogue context
+	provider = "qwen2.5:3b"
+	if translationEN == "" {
+		ctxKey := "qwen_v2_en:" + prevForPrompt + "|" + clean
+		u.mu.RLock()
+		cachedEN := u.memCache[ctxKey]
+		u.mu.RUnlock()
+
+		draftEN := u.TranslateJAtoEN(clean)
+		if cachedEN != "" && !ContainsJapaneseScript(cachedEN) {
+			translationEN = cachedEN
+		} else if qwenEN, err := u.callLocalQwenJAtoEN(clean, prevForPrompt, draftEN, strings.Join(notes, " ")); err == nil && qwenEN != "" {
+			if ContainsJapaneseScript(qwenEN) {
+				// Qwen resolved an omitted Japanese subject (e.g. "帰ったよ" -> "林田君は帰ったよ"): translate the resolved Japanese sentence!
+				translationEN = u.TranslateJAtoEN(qwenEN)
+			} else {
+				translationEN = qwenEN
+			}
+			if translationEN != "" {
+				u.saveCache(ctxKey, translationEN, "qwen2.5:3b-ja-en")
+			}
+		}
+		if translationEN == "" {
+			translationEN = draftEN
+			provider = "gclients5-nmt"
+		}
+	}
+
+	// 4. Produce JP -> ID grounded by Qwen 2.5's contextual English disambiguation
+	if translationID == "" {
+		ctxIDKey := "qwen_v2_id:" + prevForPrompt + "|" + clean
+		u.mu.RLock()
+		cachedID := u.memCache[ctxIDKey]
+		u.mu.RUnlock()
+
+		if cachedID != "" && !ContainsJapaneseScript(cachedID) {
+			translationID = cachedID
+		} else if translationEN != "" {
+			if idFromEN, err := fetchGoogleClients5Translate(translationEN, "en", "id"); err == nil && idFromEN != "" {
+				translationID = StripSubtitleMarkup(idFromEN)
+				u.saveCache(ctxIDKey, translationID, provider+"-ja-id")
+			}
+		}
+		if translationID == "" {
+			translationID = u.TranslateJAtoID(clean)
+		}
+	}
+
+	if softsubID != "" {
+		provider = "softsub+" + provider
+	}
+	return translationID, translationEN, provider
+}
+
+func (u *TranslateUsecase) callLocalQwenJAtoEN(jaText, prevJaText, draftEN, semanticNotes string) (string, error) {
+	baseURL := "http://127.0.0.1:11434/v1"
+	modelName := "qwen2.5:3b"
+	u.mu.RLock()
+	if u.Cfg != nil {
+		if u.Cfg.LLM.BaseURL != "" {
+			baseURL = u.Cfg.LLM.BaseURL
+		}
+		if u.Cfg.LLM.Model != "" {
+			modelName = u.Cfg.LLM.Model
+		}
+	}
+	u.mu.RUnlock()
+
+	resolvedBase, online, _ := config.ResolveServiceURL(baseURL, "models", 700*time.Millisecond)
+	if !online {
+		return "", fmt.Errorf("local qwen offline")
+	}
+
+	var promptBuilder strings.Builder
+	if prevJaText != "" {
+		promptBuilder.WriteString("Previous Japanese line: ")
+		promptBuilder.WriteString(prevJaText)
+		promptBuilder.WriteString("\n")
+	}
+	promptBuilder.WriteString("Current Japanese line: ")
+	promptBuilder.WriteString(jaText)
+	promptBuilder.WriteString("\n")
+	if draftEN != "" {
+		promptBuilder.WriteString("Draft English translation: ")
+		promptBuilder.WriteString(draftEN)
+		promptBuilder.WriteString("\n")
+	}
+	if semanticNotes != "" {
+		promptBuilder.WriteString(semanticNotes)
+		promptBuilder.WriteString("\n")
+	}
+	promptBuilder.WriteString("Write the accurate, natural English anime subtitle for the Current Japanese line (1 sentence only):")
+
+	payload := map[string]interface{}{
+		"model": modelName,
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": "You are a professional Japanese-to-English anime subtitle translator. Refine the Draft English translation using the Japanese line, previous context, and Notes. Output ONLY the final English subtitle sentence without numbering or quotes.",
+			},
+			{
+				"role":    "user",
+				"content": promptBuilder.String(),
+			},
+		},
+		"temperature": 0.1,
+		"max_tokens":  80,
+		"stream":      false,
+	}
+	bodyBytes, _ := json.Marshal(payload)
+
+	endpoint := strings.TrimRight(resolvedBase, "/") + "/chat/completions"
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5500 * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("qwen status %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil || len(resData.Choices) == 0 {
+		return "", fmt.Errorf("empty qwen response")
+	}
+
+	raw := strings.TrimSpace(resData.Choices[0].Message.Content)
+	firstLine := strings.Split(raw, "\n")[0]
+	firstLine = strings.TrimSpace(firstLine)
+	if idx := strings.Index(firstLine, "=>"); idx != -1 {
+		firstLine = strings.TrimSpace(firstLine[idx+2:])
+	}
+	firstLine = leadingListNumberRegex.ReplaceAllString(firstLine, "")
+	firstLine = strings.Trim(firstLine, `"' `)
+	return StripSubtitleMarkup(firstLine), nil
 }
 
 // fetchGoogleClients5Translate uses Google's dict-chrome-ex NMT endpoint which returns pure neural translations
