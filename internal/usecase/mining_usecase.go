@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -168,10 +169,14 @@ func (u *MiningUsecase) ParseMediaText(rawContent string, format string) []domai
 				}
 			}
 			if len(textLines) > 0 {
-				jaText := textLines[0]
-				enText := ""
-				if len(textLines) > 1 {
+				var jaText, enText string
+				if len(textLines) > 1 && ContainsJapaneseScript(textLines[0]) && !ContainsJapaneseScript(textLines[1]) {
+					// Bilingual SRT block: Line 1 is Japanese, Line 2+ is Translation
+					jaText = textLines[0]
 					enText = strings.Join(textLines[1:], " ")
+				} else {
+					// Monolingual multi-line SRT block (e.g. "Waduh, kayaknya\nponselku basah!"): join all lines!
+					jaText = strings.Join(textLines, " ")
 				}
 				if !foundTime {
 					startMs = int64((idx - 1) * 4000)
@@ -582,12 +587,14 @@ func (u *MiningUsecase) SliceOriginalAudioClip(uploadsDir string, mediaFilename 
 
 	startSec := fmt.Sprintf("%.3f", float64(padStartMs)/1000.0)
 	durationSec := fmt.Sprintf("%.3f", float64(padEndMs-padStartMs)/1000.0)
+	audioMap, _, _ := u.DetectBestMediaStreams(context.Background(), sourceVideoPath)
 
 	cmd := exec.Command(
 		"ffmpeg", "-y",
 		"-ss", startSec,
 		"-i", sourceVideoPath,
 		"-t", durationSec,
+		"-map", audioMap,
 		"-vn",
 		"-acodec", "pcm_s16le",
 		"-ar", "24000",
@@ -614,6 +621,247 @@ func hmsToMs(hStr, mStr, sStr, msStr string) int64 {
 
 func (u *MiningUsecase) FormatTimestampRange(startMs, endMs int64) string {
 	return fmt.Sprintf("%s - %s", msToClock(startMs), msToClock(endMs))
+}
+
+func ContainsJapaneseScript(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3040 && r <= 0x309F) || (r >= 0x30A0 && r <= 0x30FF) || (r >= 0x4E00 && r <= 0x9FFF) {
+			return true
+		}
+	}
+	return false
+}
+
+// DetectBestMediaStreams inspects an MKV/MP4 container via ffprobe to handle:
+// - Dual-Audio releases (selecting the Japanese audio stream over English dubs)
+// - Multi-Sub releases (selecting Japanese softsubs and/or Indonesian softsubs across any fansub)
+func (u *MiningUsecase) DetectBestMediaStreams(ctx context.Context, videoPath string) (audioMap string, jpSubMap string, idSubMap string) {
+	audioMap = "0:a:0"
+	cmd := exec.CommandContext(
+		ctx,
+		"ffprobe",
+		"-v", "error",
+		"-show_entries", "stream=index,codec_type,codec_name:stream_tags=language,title",
+		"-of", "json",
+		videoPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return audioMap, "", "0:s:0"
+	}
+
+	var probe struct {
+		Streams []struct {
+			Index     int    `json:"index"`
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+			Tags      struct {
+				Language string `json:"language"`
+				Title    string `json:"title"`
+			} `json:"tags"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &probe); err != nil {
+		return audioMap, "", "0:s:0"
+	}
+
+	firstAudio := ""
+	firstTextSub := ""
+
+	for _, st := range probe.Streams {
+		lang := strings.ToLower(strings.TrimSpace(st.Tags.Language))
+		title := strings.ToLower(strings.TrimSpace(st.Tags.Title))
+
+		switch st.CodecType {
+		case "audio":
+			mapSpec := fmt.Sprintf("0:%d", st.Index)
+			if firstAudio == "" {
+				firstAudio = mapSpec
+			}
+			if lang == "jpn" || lang == "ja" || strings.Contains(title, "jap") || strings.Contains(title, "jp") {
+				audioMap = mapSpec
+			}
+
+		case "subtitle":
+			// Skip bitmap subtitles (PGS/VobSub) that cannot be converted to ASS/SRT text
+			if st.CodecName == "hdmv_pgs_subtitle" || st.CodecName == "dvd_subtitle" || st.CodecName == "dvb_subtitle" {
+				continue
+			}
+			mapSpec := fmt.Sprintf("0:%d", st.Index)
+			if firstTextSub == "" {
+				firstTextSub = mapSpec
+			}
+			if lang == "jpn" || lang == "ja" || strings.Contains(title, "jap") || strings.Contains(title, "jp") {
+				if jpSubMap == "" {
+					jpSubMap = mapSpec
+				}
+			} else if lang == "ind" || lang == "id" || lang == "may" || lang == "msa" || strings.Contains(title, "indo") || strings.Contains(title, "id") {
+				if idSubMap == "" {
+					idSubMap = mapSpec
+				}
+			}
+		}
+	}
+
+	if audioMap == "0:a:0" && firstAudio != "" {
+		audioMap = firstAudio
+	}
+	if idSubMap == "" && firstTextSub != "" && firstTextSub != jpSubMap {
+		idSubMap = firstTextSub
+	}
+	return audioMap, jpSubMap, idSubMap
+}
+
+var (
+	assTagBlockRegex = regexp.MustCompile(`\{[^}]*\}`)
+	assTimeRegex     = regexp.MustCompile(`^(\d+):(\d{2}):(\d{2})\.(\d{2})$`)
+)
+
+// ExtractCleanDialogueSoftsubs extracts a subtitle track in native ASS format and filters out
+// Aegisub Karaoke FX (OP/ED/Effector), Vector Drawings (\p1), and Screen Signs/Typesetting (\pos, \move, Style: sign/TS),
+// while joining multi-line \N breaks with spaces so fansub sentences are never truncated or polluted.
+func (u *MiningUsecase) ExtractCleanDialogueSoftsubs(
+	ctx context.Context,
+	videoPath string,
+	subMap string,
+	startSec int,
+	durationSec int,
+) []domain.MediaCue {
+	if subMap == "" {
+		return nil
+	}
+	tmpAss := fmt.Sprintf("%s.%s.%d_%d.tmp.ass", videoPath, strings.ReplaceAll(subMap, ":", "_"), startSec, durationSec)
+	defer os.Remove(tmpAss)
+
+	args := []string{"-y"}
+	if startSec > 0 {
+		args = append(args, "-ss", strconv.Itoa(startSec))
+	}
+	args = append(args, "-i", videoPath)
+	if durationSec > 0 {
+		args = append(args, "-t", strconv.Itoa(durationSec))
+	}
+	args = append(args, "-map", subMap, "-f", "ass", tmpAss)
+
+	if err := exec.CommandContext(ctx, "ffmpeg", args...).Run(); err != nil {
+		return nil
+	}
+	rawBytes, err := os.ReadFile(tmpAss)
+	if err != nil || len(rawBytes) == 0 {
+		return nil
+	}
+
+	offsetMs := int64(startSec * 1000)
+	lines := strings.Split(string(rawBytes), "\n")
+	var cues []domain.MediaCue
+	idx := 1
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Dialogue:") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "Dialogue:"))
+		// Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+		parts := strings.SplitN(rest, ",", 10)
+		if len(parts) < 10 {
+			continue
+		}
+
+		startStr := strings.TrimSpace(parts[1])
+		endStr := strings.TrimSpace(parts[2])
+		style := strings.ToLower(strings.TrimSpace(parts[3]))
+		actorName := strings.ToLower(strings.TrimSpace(parts[4]))
+		effect := strings.ToLower(strings.TrimSpace(parts[8]))
+		rawText := parts[9]
+
+		// 1. Filter out Karaoke FX, Opening/Ending lyrics, and Aegisub template effects
+		if effect != "" && (strings.Contains(effect, "fx") || strings.Contains(effect, "kara") || strings.Contains(effect, "template") || strings.Contains(effect, "code")) {
+			continue
+		}
+		if isNonDialogueAssStyle(style) || isNonDialogueAssStyle(actorName) {
+			continue
+		}
+
+		// 2. Filter out vector drawings (\p1..\p9) and screen sign typesetting (\pos, \move, \org)
+		lowerRaw := strings.ToLower(rawText)
+		if strings.Contains(lowerRaw, `\p1`) || strings.Contains(lowerRaw, `\p2`) ||
+			strings.Contains(lowerRaw, `\pos(`) || strings.Contains(lowerRaw, `\move(`) || strings.Contains(lowerRaw, `\org(`) {
+			continue
+		}
+
+		// 3. Join Aegisub multi-line breaks (\N, \n, \h) with spaces BEFORE stripping tags
+		cleanText := strings.ReplaceAll(rawText, `\N`, " ")
+		cleanText = strings.ReplaceAll(cleanText, `\n`, " ")
+		cleanText = strings.ReplaceAll(cleanText, `\h`, " ")
+		cleanText = assTagBlockRegex.ReplaceAllString(cleanText, "")
+		cleanText = StripSubtitleMarkup(cleanText)
+		cleanText = strings.Join(strings.Fields(cleanText), " ")
+		if cleanText == "" {
+			continue
+		}
+
+		startMs := parseAssTimeMs(startStr) + offsetMs
+		endMs := parseAssTimeMs(endStr) + offsetMs
+		if endMs <= startMs {
+			endMs = startMs + 1500
+		}
+
+		// 4. Deduplicate layered border/shadow duplicate dialogue lines at identical timestamps
+		if len(cues) > 0 {
+			last := &cues[len(cues)-1]
+			if last.Sentence == cleanText && absDiffInt64(last.StartTimeMs, startMs) <= 200 {
+				continue
+			}
+		}
+
+		cues = append(cues, domain.MediaCue{
+			Index:          idx,
+			StartTimeMs:    startMs,
+			EndTimeMs:      endMs,
+			TimestampLabel: fmt.Sprintf("%s - %s", msToClock(startMs), msToClock(endMs)),
+			Sentence:       cleanText,
+		})
+		idx++
+	}
+
+	return cues
+}
+
+func isNonDialogueAssStyle(style string) bool {
+	if style == "" {
+		return false
+	}
+	nonDialogueTokens := []string{
+		"op-", "ed-", "op_", "ed_", "opening", "ending", "kara",
+		"sign", "ts", "typeset", "title", "título", "judul",
+		"credit", "logo", "eyecatch", "next", "preview", "song", "lyric",
+	}
+	for _, tok := range nonDialogueTokens {
+		if style == tok || strings.HasPrefix(style, tok) || strings.Contains(style, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseAssTimeMs(t string) int64 {
+	m := assTimeRegex.FindStringSubmatch(strings.TrimSpace(t))
+	if len(m) != 5 {
+		return 0
+	}
+	h, _ := strconv.ParseInt(m[1], 10, 64)
+	min, _ := strconv.ParseInt(m[2], 10, 64)
+	sec, _ := strconv.ParseInt(m[3], 10, 64)
+	cs, _ := strconv.ParseInt(m[4], 10, 64)
+	return ((h*3600 + min*60 + sec) * 1000) + (cs * 10)
+}
+
+func absDiffInt64(a, b int64) int64 {
+	if a < b {
+		return b - a
+	}
+	return a - b
 }
 
 func msToClock(ms int64) string {
