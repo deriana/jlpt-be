@@ -2,7 +2,8 @@
 """
 Real-Time Streaming Offline Japanese Speech-to-Text Extractor (SSE Ready)
 Targets ONLY Japanese speech (language="ja") from video/audio using local Faster-Whisper
-and flushes each sentence segment immediately to stdout as NDJSON (Newline-Delimited JSON).
+with Japanese Kanji/Contextual Prompting, Per-Sentence Timestamp Splitting,
+and Homophone/Katakana Normalization, flushing each sentence segment immediately to stdout as NDJSON.
 """
 
 import argparse
@@ -14,6 +15,60 @@ from faster_whisper import WhisperModel
 
 DEFAULT_MODEL_PATH = "/home/hideri/coding/Open-LLM-VTuber/models/whisper_base"
 JP_CHAR_REGEX = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]")
+
+# Contextual prompt guides Whisper to prefer standard Japanese Kanji (広報, 生徒会, 了解, 先輩, etc.)
+ANIME_INITIAL_PROMPT = (
+    "日本のアニメの日常会話字幕。生徒会、広報活動、広報、ポスター、張り替える、肝心の、先輩、後輩、"
+    "了解です、さっき、今起きたって連絡が、本当に、大丈夫、ありがとう。"
+)
+
+HOMOPHONE_CORRECTIONS = [
+    ("コウホー活動", "広報活動"),
+    ("コウホー", "広報"),
+    ("こうほう活動", "広報活動"),
+    ("張り返る", "張り替える"),
+    ("漢人の", "肝心の"),
+    ("そっき", "さっき"),
+    ("先今起きた", "さっき今起きた"),
+    ("矢解です", "了解です"),
+    ("妖怪です", "了解です"),
+    ("りょうかいです", "了解です"),
+    ("決会して", "結果して"),
+]
+
+
+def normalize_japanese_transcript(text: str) -> str:
+    cleaned = text.strip()
+    for wrong, right in HOMOPHONE_CORRECTIONS:
+        cleaned = cleaned.replace(wrong, right)
+    return cleaned
+
+
+def split_into_sentences_with_timestamps(text: str, start_sec: float, end_sec: float):
+    """
+    If a Whisper segment spans multiple sentences separated by 。 / ？ / ！ / ? / !,
+    splits them into individual sentence cues with proportional timestamps.
+    """
+    parts = re.split(r"(?<=[。？！?!])\s*", text.strip())
+    sentences = [p.strip() for p in parts if p and p.strip() and JP_CHAR_REGEX.search(p)]
+    if len(sentences) <= 1:
+        return [(text.strip(), start_sec, end_sec)]
+
+    total_chars = sum(len(s) for s in sentences)
+    if total_chars <= 0:
+        return [(text.strip(), start_sec, end_sec)]
+
+    dur = max(0.8, end_sec - start_sec)
+    result = []
+    cur_start = start_sec
+    for i, s in enumerate(sentences):
+        if i == len(sentences) - 1:
+            s_end = end_sec
+        else:
+            s_end = cur_start + dur * (len(s) / total_chars)
+        result.append((s, cur_start, s_end))
+        cur_start = s_end
+    return result
 
 
 def emit(payload: dict):
@@ -47,8 +102,8 @@ def main():
     emit({
         "type": "status",
         "stage": "loading_model",
-        "progress": 15,
-        "message": "Memuat model AI Faster-Whisper Offline (Target: Bahasa Jepang / ja)...",
+        "progress": 12,
+        "message": "Memuat model AI Faster-Whisper Offline (Target: Bahasa Jepang / Kanji Kontekstual)...",
     })
 
     model_dir = args.model if os.path.exists(args.model) else "base"
@@ -57,19 +112,25 @@ def main():
     emit({
         "type": "status",
         "stage": "transcribing",
-        "progress": 20,
-        "message": "Memindai percakapan Bahasa Jepang dari audio video (VAD aktif)...",
+        "progress": 16,
+        "message": "Memindai seluruh percakapan Bahasa Jepang dari video (VAD + Kanji Context aktif)...",
     })
 
     segments, info = model.transcribe(
         args.input,
         language="ja",
         task="transcribe",
+        initial_prompt=ANIME_INITIAL_PROMPT,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=200),
-        beam_size=1,
+        vad_parameters=dict(
+            min_silence_duration_ms=250,
+            speech_pad_ms=180,
+            max_speech_duration_s=5.5,
+        ),
+        beam_size=2,
         best_of=1,
         condition_on_previous_text=False,
+        temperature=0.0,
     )
 
     total_dur = max(1.0, float(info.duration or 1.0))
@@ -77,48 +138,49 @@ def main():
         "type": "info",
         "language": "ja",
         "duration_sec": round(total_dur, 2),
-        "progress": 22,
-        "message": f"Durasi audio terdeteksi: {int(total_dur // 60):02d}:{int(total_dur % 60):02d}. Mengekstrak kalimat Jepang...",
+        "progress": 18,
+        "message": f"Durasi video terdeteksi: {int(total_dur // 60):02d}:{int(total_dur % 60):02d}. Mengekstrak kalimat Jepang secara real-time...",
     })
 
     idx = 1
     srt_blocks = []
 
     for seg in segments:
-        text = seg.text.strip()
-        # Only keep segments that actually contain Japanese characters (Hiragana/Katakana/Kanji)
-        if not text or not JP_CHAR_REGEX.search(text):
+        norm_text = normalize_japanese_transcript(seg.text)
+        if not norm_text or not JP_CHAR_REGEX.search(norm_text):
             continue
 
-        start_ms = args.offset_ms + int(round(seg.start * 1000))
-        end_ms = args.offset_ms + int(round(seg.end * 1000))
-        if end_ms <= start_ms:
-            end_ms = start_ms + 1500
+        sub_sentences = split_into_sentences_with_timestamps(norm_text, seg.start, seg.end)
+        for sent_text, s_start, s_end in sub_sentences:
+            start_ms = args.offset_ms + int(round(s_start * 1000))
+            end_ms = args.offset_ms + int(round(s_end * 1000))
+            if end_ms <= start_ms:
+                end_ms = start_ms + 1500
 
-        start_srt = format_srt_time(start_ms / 1000.0)
-        end_srt = format_srt_time(end_ms / 1000.0)
-        srt_block = f"{idx}\n{start_srt} --> {end_srt}\n{text}"
-        srt_blocks.append(srt_block)
+            start_srt = format_srt_time(start_ms / 1000.0)
+            end_srt = format_srt_time(end_ms / 1000.0)
+            srt_block = f"{idx}\n{start_srt} --> {end_srt}\n{sent_text}"
+            srt_blocks.append(srt_block)
 
-        pct = min(98, 22 + int(round((seg.end / total_dur) * 76)))
-        cur_min = int(seg.end // 60)
-        cur_sec = int(seg.end % 60)
-        tot_min = int(total_dur // 60)
-        tot_sec = int(total_dur % 60)
+            pct = min(98, 18 + int(round((s_end / total_dur) * 80)))
+            cur_min = int((start_ms // 1000) // 60)
+            cur_sec = int((start_ms // 1000) % 60)
+            tot_min = int(((args.offset_ms // 1000) + total_dur) // 60)
+            tot_sec = int(((args.offset_ms // 1000) + total_dur) % 60)
 
-        emit({
-            "type": "segment",
-            "index": idx,
-            "start_time_ms": start_ms,
-            "end_time_ms": end_ms,
-            "sentence": text,
-            "srt_block": srt_block,
-            "progress": pct,
-            "current_sec": round(seg.end, 2),
-            "total_sec": round(total_dur, 2),
-            "message": f"Menyalin kalimat Jepang #{idx} ({cur_min:02d}:{cur_sec:02d} / {tot_min:02d}:{tot_sec:02d})...",
-        })
-        idx += 1
+            emit({
+                "type": "segment",
+                "index": idx,
+                "start_time_ms": start_ms,
+                "end_time_ms": end_ms,
+                "sentence": sent_text,
+                "srt_block": srt_block,
+                "progress": pct,
+                "current_sec": round(s_end, 2),
+                "total_sec": round(total_dur, 2),
+                "message": f"Menyalin kalimat Jepang #{idx} (Posisi {cur_min:02d}:{cur_sec:02d} / {tot_min:02d}:{tot_sec:02d})...",
+            })
+            idx += 1
 
     emit({
         "type": "done",

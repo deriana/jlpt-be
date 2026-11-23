@@ -240,14 +240,19 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			// Only index terms with >= 2 runes OR kanji characters to avoid single-kana particle noise
 			runes := []rune(item.Word)
 			if len(runes) >= 2 || (len(runes) == 1 && isKanjiRune(runes[0])) {
-				if _, exists := idx[item.Word]; !exists {
+				// Prefer きょう reading for 今日 over こんにち
+				if item.Word == "今日" && item.Reading == "きょう" {
+					idx[item.Word] = item
+				} else if _, exists := idx[item.Word]; !exists {
 					idx[item.Word] = item
 				}
 			}
-			// Also index verb stems (dropping final う-row/る for godan/ichidan conjugated matches)
-			if len(runes) >= 2 && isKanjiRune(runes[0]) {
+			// Index verb/adjective stem ONLY when the trailing character is Hiragana okurigana (e.g. 短い -> 短, 諦める -> 諦め)
+			// NEVER drop a Kanji character from a 2-Kanji compound noun (which previously caused 会 to match 会議 or 前 to match 前者!)
+			if len(runes) >= 2 && isKanjiRune(runes[0]) && isHiraganaRune(runes[len(runes)-1]) {
 				stem := string(runes[:len(runes)-1])
-				if len([]rune(stem)) >= 1 {
+				stemRunes := []rune(stem)
+				if len(stemRunes) >= 2 {
 					if _, exists := idx[stem]; !exists {
 						idx[stem] = item
 					}
@@ -255,6 +260,42 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			}
 		}
 	}
+
+	// Ensure high-frequency school/anime compounds (広報 = Humas, 生徒会 = OSIS, 張り替える = menempel ulang) are indexed
+	animeExtras := []domain.VocabItem{
+		{
+			ID:       "custom-kouhou",
+			Word:     "広報",
+			Reading:  "こうほう",
+			Romaji:   "kouhou",
+			Meanings: []string{"humas (hubungan masyarakat)", "public relations", "publisitas"},
+			Level:    "N3",
+			POS:      []string{"n", "vs"},
+		},
+		{
+			ID:       "custom-seitokai",
+			Word:     "生徒会",
+			Reading:  "せいとかい",
+			Romaji:   "seitokai",
+			Meanings: []string{"OSIS (dewan siswa)", "student council"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-harikaeru",
+			Word:     "張り替える",
+			Reading:  "はりかえる",
+			Romaji:   "harikaeru",
+			Meanings: []string{"mengganti tempelan", "menempel ulang", "to re-paste"},
+			Level:    "N3",
+			POS:      []string{"v1", "vt"},
+		},
+	}
+	for _, ex := range animeExtras {
+		idx[ex.Word] = ex
+	}
+	idx["コウホー"] = animeExtras[0]
+
 	r.vocabIndex = idx
 	r.indexLoaded = true
 	return r.vocabIndex, nil
@@ -262,4 +303,8 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 
 func isKanjiRune(ch rune) bool {
 	return (ch >= 0x4E00 && ch <= 0x9FFF) || (ch >= 0x3400 && ch <= 0x4DBF)
+}
+
+func isHiraganaRune(ch rune) bool {
+	return ch >= 0x3040 && ch <= 0x309F
 }

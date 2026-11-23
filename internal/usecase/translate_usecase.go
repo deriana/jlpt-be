@@ -244,8 +244,12 @@ func (u *TranslateUsecase) TranslateENtoID(text string, allowOnline bool) string
 		return v
 	}
 
-	// 5. Optional automatic online Google Translate GTX (cached forever in SQLite!)
+	// 5. Optional automatic online translation (MyMemory + Google GTX fallback, cached forever in SQLite!)
 	if allowOnline {
+		if onlineRes, err := fetchMyMemoryTranslate(clean, "en", "id"); err == nil && onlineRes != "" {
+			u.saveCache(lower, onlineRes, "auto-mymemory")
+			return onlineRes
+		}
 		if onlineRes, err := fetchGoogleTranslateGTX(clean); err == nil && onlineRes != "" {
 			u.saveCache(lower, onlineRes, "auto-gtx")
 			return onlineRes
@@ -299,12 +303,17 @@ func (u *TranslateUsecase) saveCache(lowerKey, targetID, provider string) {
 }
 
 // TranslateJAtoID translates a Japanese sentence into Bahasa Indonesia (with SQLite caching)
-// so that raw videos without softsubs still get automatic Indonesian subtitle translations during SSE extraction.
+// so that raw videos without softsubs still get accurate Indonesian subtitle translations during SSE extraction.
 func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
 	clean := strings.TrimSpace(jaText)
 	if clean == "" {
 		return ""
 	}
+	// Normalize common Katakana phonetics so translators know コウホー is 広報 (Humas / Public Relations)
+	clean = strings.ReplaceAll(clean, "コウホー活動", "広報活動")
+	clean = strings.ReplaceAll(clean, "コウホー", "広報")
+	clean = strings.ReplaceAll(clean, "矢解です", "了解です")
+
 	cacheKey := "ja:" + clean
 	u.mu.RLock()
 	if cached, ok := u.memCache[cacheKey]; ok && cached != "" {
@@ -313,11 +322,52 @@ func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
 	}
 	u.mu.RUnlock()
 
+	if translated, err := fetchMyMemoryTranslate(clean, "ja", "id"); err == nil && translated != "" {
+		u.saveCache(cacheKey, translated, "auto-mymemory-ja-id")
+		return translated
+	}
 	if translated, err := fetchGoogleTranslateGTXWithLang(clean, "ja", "id"); err == nil && translated != "" {
 		u.saveCache(cacheKey, translated, "auto-gtx-ja-id")
 		return translated
 	}
 	return ""
+}
+
+func fetchMyMemoryTranslate(text, sourceLang, targetLang string) (string, error) {
+	client := &http.Client{Timeout: 2500 * time.Millisecond}
+	apiURL := fmt.Sprintf(
+		"https://api.mymemory.translated.net/get?q=%s&langpair=%s|%s",
+		url.QueryEscape(text),
+		url.QueryEscape(sourceLang),
+		url.QueryEscape(targetLang),
+	)
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JLPTMaster/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("mymemory status %d", resp.StatusCode)
+	}
+	var parsed struct {
+		ResponseData struct {
+			TranslatedText string `json:"translatedText"`
+		} `json:"responseData"`
+		ResponseStatus int `json:"responseStatus"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", err
+	}
+	res := strings.TrimSpace(parsed.ResponseData.TranslatedText)
+	if strings.Contains(strings.ToUpper(res), "MYMEMORY WARNING") {
+		return "", fmt.Errorf("mymemory quota warning")
+	}
+	return res, nil
 }
 
 func fetchGoogleTranslateGTX(text string) (string, error) {
