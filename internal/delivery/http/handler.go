@@ -357,6 +357,8 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		Sentence       string `json:"sentence" binding:"required"`
 		Reading        string `json:"reading"`
 		Translation    string `json:"translation"`
+		SourceType     string `json:"source_type"`
+		IsEdited       bool   `json:"is_edited"`
 		StartTimeMs    int64  `json:"start_time_ms"`
 		EndTimeMs      int64  `json:"end_time_ms"`
 		TimestampLabel string `json:"timestamp_label"`
@@ -374,6 +376,9 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 	if req.MediaType == "" {
 		req.MediaType = "anime"
 	}
+	if req.SourceType != "hardsub" && req.SourceType != "softsub" {
+		req.SourceType = "softsub"
+	}
 
 	// If mined from an uploaded video file, slice the ORIGINAL video voice clip into a permanent WAV file for SRS flashcards!
 	audioURL := req.AudioURL
@@ -389,6 +394,8 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		Sentence:       req.Sentence,
 		Reading:        req.Reading,
 		Translation:    req.Translation,
+		SourceType:     req.SourceType,
+		IsEdited:       req.IsEdited,
 		StartTimeMs:    req.StartTimeMs,
 		EndTimeMs:      req.EndTimeMs,
 		TimestampLabel: req.TimestampLabel,
@@ -402,6 +409,56 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"mined_sentence": savedMined,
 		"flashcard":      card,
+	})
+}
+
+// UpdateAndReanalyzeCue handles inline quick-edits on dialogue cards:
+// 1. Updates sentence & translation, marks is_edited = true.
+// 2. Automatically re-runs morphological tokenization (MatchSentenceVocab) so vocabulary badges reflect the corrected Kanji/Kana immediately.
+// 3. If id > 0 (an already saved sentence in SQLite), persists the update to mined_sentences.
+func (h *Handler) UpdateAndReanalyzeCue(c *gin.Context) {
+	var req struct {
+		ID            int64  `json:"id"`
+		Sentence      string `json:"sentence" binding:"required"`
+		TranslationID string `json:"translation_id"`
+		TranslationEN string `json:"translation_en"`
+		SourceType    string `json:"source_type"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	cleanSentence := strings.TrimSpace(req.Sentence)
+	matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(cleanSentence)
+
+	trID := strings.TrimSpace(req.TranslationID)
+	trEN := strings.TrimSpace(req.TranslationEN)
+	if trID == "" && h.TranslateUC != nil {
+		trID, trEN, _ = h.TranslateUC.TranslateTranscriptCueJA(cleanSentence, "", matched, "")
+	} else if trEN == "" && h.TranslateUC != nil {
+		trEN = h.TranslateUC.TranslateJAtoEN(cleanSentence)
+	}
+
+	sourceType := req.SourceType
+	if sourceType != "hardsub" && sourceType != "softsub" {
+		sourceType = "hardsub"
+	}
+
+	if req.ID > 0 {
+		_ = h.MiningUC.MiningRepo.UpdateMinedSentence(getUserID(c), req.ID, cleanSentence, trID, matched)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"sentence":       cleanSentence,
+		"translation":    trID,
+		"translation_id": trID,
+		"translation_en": trEN,
+		"source_type":    sourceType,
+		"is_edited":      true,
+		"matched_vocab":  matched,
+		"n4_n3_count":    n4n3Count,
+		"coverage_rate":  coverage,
 	})
 }
 
@@ -590,6 +647,8 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 		prevJpSentence := ""
 		for i, cue := range jpSoftsubCues {
 			cue.Index = i + 1
+			cue.SourceType = "softsub"
+			cue.IsEdited = false
 			if h.TranslateUC != nil {
 				cue.Sentence = h.TranslateUC.NormalizeJapaneseTranscript(cue.Sentence)
 			}
@@ -744,14 +803,12 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				raw["message"] = "Selesai dipindai, namun tidak ditemukan dialog Bahasa Jepang pada rentang detik ini (mungkin hanya musik BGM/hening). Ekstraksi dihentikan otomatis agar tidak loop."
 			}
 		} else if evType == "segment" {
-			segmentCount++
 			sentence, _ := raw["sentence"].(string)
 			if h.TranslateUC != nil {
 				sentence = h.TranslateUC.NormalizeJapaneseTranscript(sentence)
 			}
 			startMs := int64(0)
 			endMs := int64(0)
-			idx := segmentCount
 			if v, ok := raw["start_time_ms"].(float64); ok {
 				startMs = int64(v)
 			}
@@ -759,11 +816,23 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				endMs = int64(v)
 			}
 
+			// Filter out OCR/ASR garbage lines (empty, no Japanese script, or duration < 400ms)
+			if !usecase.IsValidJapaneseDialogueCue(sentence, startMs, endMs) {
+				continue
+			}
+
+			segmentCount++
+			idx := segmentCount
+
 			// 1. Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
 			matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(sentence)
 
 			// 2. Match embedded Indonesian softsub (if present) + translate JP -> ID and JP -> EN via Local AI Qwen 2.5 (3B)
 			softsubID := findOverlappingSoftsubTranslation(indoSoftsubCues, usedSoftsubs, startMs, endMs)
+			sourceType := "hardsub"
+			if len(indoSoftsubCues) > 0 && softsubID != "" {
+				sourceType = "softsub"
+			}
 			translationID := softsubID
 			translationEN := ""
 			translationProvider := "softsub"
@@ -788,11 +857,14 @@ func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
 				TranslationID:       translationID,
 				TranslationEN:       translationEN,
 				TranslationProvider: translationProvider,
+				SourceType:          sourceType,
+				IsEdited:            false,
 				ClipAudioURL:        clipURL,
 				MatchedVocab:        matched,
 				N4N3Count:           n4n3Count,
 				CoverageRate:        coverage,
 			}
+			raw["index"] = idx
 			raw["sentence"] = sentence
 			raw["cue"] = cue
 		}

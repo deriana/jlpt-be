@@ -228,10 +228,12 @@ def main():
 
         sub_sentences = split_into_sentences_with_timestamps(norm_text, seg.start, seg.end)
         for sent_text, s_start, s_end in sub_sentences:
+            if not sent_text or not JP_CHAR_REGEX.search(sent_text):
+                continue
             start_ms = args.offset_ms + int(round(s_start * 1000))
             end_ms = args.offset_ms + int(round(s_end * 1000))
-            if end_ms <= start_ms:
-                end_ms = start_ms + 1500
+            if (end_ms - start_ms) < 400:
+                continue
 
             start_srt = format_srt_time(start_ms / 1000.0)
             end_srt = format_srt_time(end_ms / 1000.0)

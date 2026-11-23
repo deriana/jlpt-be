@@ -169,6 +169,8 @@ type MediaCue struct {
 	TranslationID       string              `json:"translation_id,omitempty"`
 	TranslationEN       string              `json:"translation_en,omitempty"`
 	TranslationProvider string              `json:"translation_provider,omitempty"`
+	SourceType          string              `json:"source_type"` // "softsub" or "hardsub"
+	IsEdited            bool                `json:"is_edited"`
 	ClipAudioURL        string              `json:"clip_audio_url,omitempty"`
 	MatchedVocab        []MatchedVocabToken `json:"matched_vocab"`
 	N4N3Count           int                 `json:"n4_n3_count"`
@@ -194,6 +196,8 @@ type MinedSentence struct {
 	Sentence       string              `json:"sentence"`
 	Reading        string              `json:"reading"`
 	Translation    string              `json:"translation"`
+	SourceType     string              `json:"source_type"` // "softsub" or "hardsub"
+	IsEdited       bool                `json:"is_edited"`
 	StartTimeMs    int64               `json:"start_time_ms"`
 	EndTimeMs      int64               `json:"end_time_ms"`
 	TimestampLabel string              `json:"timestamp_label"`

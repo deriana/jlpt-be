@@ -186,6 +186,8 @@ func (d *Database) Migrate() error {
 		sentence TEXT NOT NULL,
 		reading TEXT NOT NULL DEFAULT '',
 		translation TEXT NOT NULL DEFAULT '',
+		source_type TEXT NOT NULL DEFAULT 'softsub',
+		is_edited INTEGER NOT NULL DEFAULT 0,
 		start_time_ms INTEGER NOT NULL DEFAULT 0,
 		end_time_ms INTEGER NOT NULL DEFAULT 0,
 		timestamp_label TEXT NOT NULL DEFAULT '',
@@ -221,7 +223,13 @@ func (d *Database) Migrate() error {
 	);
 	`
 	_, err := d.DB.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+	// Non-destructive migration for existing SQLite databases
+	_, _ = d.DB.Exec(`ALTER TABLE mined_sentences ADD COLUMN source_type TEXT NOT NULL DEFAULT 'softsub'`)
+	_, _ = d.DB.Exec(`ALTER TABLE mined_sentences ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0`)
+	return nil
 }
 
 // SyncOpenJLPTIfEmpty checks if OpenJLPT tables are populated; if empty, imports from openjlpt.sqlite or JSON.

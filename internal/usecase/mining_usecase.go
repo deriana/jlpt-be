@@ -389,6 +389,21 @@ var (
 	lrcTimeRegex = regexp.MustCompile(`\[(\d{1,2}):(\d{2})(?:[\.:](\d{2,3}))?\](.*)`)
 )
 
+// IsValidJapaneseDialogueCue filters out OCR/ASR garbage lines:
+// - Empty strings
+// - Strings containing only symbols/punctuation without any Hiragana/Katakana/Kanji
+// - Timestamp durations shorter than 400ms (< 0.4 seconds)
+func IsValidJapaneseDialogueCue(text string, startMs, endMs int64) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || !ContainsJapaneseScript(trimmed) {
+		return false
+	}
+	if endMs > startMs && (endMs-startMs) < 400 {
+		return false
+	}
+	return true
+}
+
 // ParseMediaText parses .srt anime subtitles, .lrc Japanese song lyrics, or plain text lines,
 // extracts timestamps, and runs Automated OpenJLPT Vocabulary Matching on every line.
 func (u *MiningUsecase) ParseMediaText(rawContent string, format string) []domain.MediaCue {
@@ -451,6 +466,9 @@ func (u *MiningUsecase) ParseMediaText(rawContent string, format string) []domai
 					startMs = int64((idx - 1) * 4000)
 					endMs = startMs + 3800
 				}
+				if foundTime && (endMs-startMs) > 0 && (endMs-startMs) < 400 {
+					continue
+				}
 				matched, n4n3, cov := u.MatchSentenceVocab(jaText)
 				cues = append(cues, domain.MediaCue{
 					Index:          idx,
@@ -459,6 +477,9 @@ func (u *MiningUsecase) ParseMediaText(rawContent string, format string) []domai
 					TimestampLabel: fmt.Sprintf("%s - %s", msToClock(startMs), msToClock(endMs)),
 					Sentence:       jaText,
 					Translation:    enText,
+					TranslationID:  enText,
+					SourceType:     "softsub",
+					IsEdited:       false,
 					MatchedVocab:   matched,
 					N4N3Count:      n4n3,
 					CoverageRate:   cov,

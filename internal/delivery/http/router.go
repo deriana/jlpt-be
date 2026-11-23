@@ -38,6 +38,7 @@ func NewRouter(h *Handler) *gin.Engine {
 		api.GET("/mining/presets", h.GetMiningPresets)
 		api.POST("/mining/parse", h.ParseMediaScript)
 		api.POST("/mining/match", h.MatchSentenceVocab)
+		api.PUT("/mining/cue-edit", h.UpdateAndReanalyzeCue)
 		api.GET("/mining/sentences", h.ListMinedSentences)
 		api.POST("/mining/sentences", h.SaveMinedSentence)
 		api.POST("/mining/upload-video", h.UploadVideoForSSE)
