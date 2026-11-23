@@ -1,10 +1,15 @@
 package http
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -398,6 +403,274 @@ func (h *Handler) SaveMinedSentence(c *gin.Context) {
 		"mined_sentence": savedMined,
 		"flashcard":      card,
 	})
+}
+
+// UploadVideoForSSE saves the uploaded video quickly and returns media_filename + media_url
+// so the frontend can immediately open an SSE stream (/api/v1/mining/extract-sse) for real-time Japanese sentence extraction.
+func (h *Handler) UploadVideoForSSE(c *gin.Context) {
+	file, err := c.FormFile("video")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing video file in form data"})
+		return
+	}
+
+	uploadsDir := "./data/media_uploads"
+	_ = os.MkdirAll(uploadsDir, 0755)
+
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if ext == "" {
+		ext = ".mp4"
+	}
+	safeName := fmt.Sprintf("video_%d%s", time.Now().UnixNano(), ext)
+	savedPath := filepath.Join(uploadsDir, safeName)
+
+	if err := c.SaveUploadedFile(file, savedPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save uploaded video: " + err.Error()})
+		return
+	}
+
+	title := strings.TrimSpace(c.PostForm("title"))
+	if title == "" {
+		title = strings.TrimSuffix(file.Filename, filepath.Ext(file.Filename))
+	}
+
+	// Save metadata sidecar so previously uploaded videos can be selected anytime without re-uploading
+	metaBytes, _ := json.Marshal(map[string]interface{}{
+		"media_filename": safeName,
+		"media_title":    title,
+		"media_url":      "/api/v1/mining/media/" + safeName,
+		"size_bytes":     file.Size,
+		"uploaded_at":    time.Now().Format(time.RFC3339),
+	})
+	_ = os.WriteFile(savedPath+".meta.json", metaBytes, 0644)
+
+	c.JSON(http.StatusOK, gin.H{
+		"media_filename": safeName,
+		"media_title":    title,
+		"media_url":      "/api/v1/mining/media/" + safeName,
+		"size_bytes":     file.Size,
+	})
+}
+
+// ListUploadedVideos returns all videos in ./data/media_uploads so the learner can re-extract or study any uploaded video without re-uploading.
+func (h *Handler) ListUploadedVideos(c *gin.Context) {
+	uploadsDir := "./data/media_uploads"
+	entries, err := os.ReadDir(uploadsDir)
+	if err != nil {
+		c.JSON(http.StatusOK, []interface{}{})
+		return
+	}
+
+	var videos []map[string]interface{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".json") || strings.HasSuffix(lower, ".srt") || strings.HasSuffix(lower, ".16k.wav") {
+			continue
+		}
+		if !(strings.HasSuffix(lower, ".mp4") || strings.HasSuffix(lower, ".mkv") || strings.HasSuffix(lower, ".webm") || strings.HasSuffix(lower, ".mov") || strings.HasSuffix(lower, ".mp3") || strings.HasSuffix(lower, ".wav")) {
+			continue
+		}
+
+		info, _ := entry.Info()
+		sizeBytes := int64(0)
+		modTime := time.Now()
+		if info != nil {
+			sizeBytes = info.Size()
+			modTime = info.ModTime()
+		}
+
+		title := name
+		if metaBytes, err := os.ReadFile(filepath.Join(uploadsDir, name+".meta.json")); err == nil {
+			var meta map[string]interface{}
+			if json.Unmarshal(metaBytes, &meta) == nil {
+				if t, ok := meta["media_title"].(string); ok && t != "" {
+					title = t
+				}
+			}
+		}
+
+		videos = append(videos, map[string]interface{}{
+			"media_filename": name,
+			"media_title":    title,
+			"media_url":      "/api/v1/mining/media/" + name,
+			"size_bytes":     sizeBytes,
+			"uploaded_at":    modTime.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	sort.Slice(videos, func(i, j int) bool {
+		return fmt.Sprint(videos[i]["uploaded_at"]) > fmt.Sprint(videos[j]["uploaded_at"])
+	})
+	if videos == nil {
+		videos = []map[string]interface{}{}
+	}
+	c.JSON(http.StatusOK, videos)
+}
+
+// StreamVideoExtractionSSE streams real-time Server-Sent Events (SSE) while extracting ONLY Japanese speech (language="ja")
+// from the uploaded video via FFmpeg + Local Offline Faster-Whisper, matching OpenJLPT N4/N3 vocab on each sentence as it arrives.
+func (h *Handler) StreamVideoExtractionSSE(c *gin.Context) {
+	mediaFilename := filepath.Base(c.Query("media"))
+	startSec, _ := strconv.Atoi(c.DefaultQuery("start_sec", "0"))
+	durationSec, _ := strconv.Atoi(c.DefaultQuery("duration_sec", "0"))
+
+	if startSec < 0 {
+		startSec = 0
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+
+	sendSSE := func(payload interface{}) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(b))
+		c.Writer.Flush()
+	}
+
+	uploadsDir := "./data/media_uploads"
+	videoPath := filepath.Join(uploadsDir, mediaFilename)
+	if _, err := os.Stat(videoPath); err != nil {
+		sendSSE(map[string]interface{}{
+			"type":    "error",
+			"message": "File video tidak ditemukan: " + mediaFilename,
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Step 1: Extract 16kHz mono WAV for the target range using FFmpeg
+	rangeDesc := "Full Video"
+	if durationSec > 0 {
+		rangeDesc = fmt.Sprintf("Detik %d s/d %d (%d detik)", startSec, startSec+durationSec, durationSec)
+	}
+	sendSSE(map[string]interface{}{
+		"type":     "status",
+		"stage":    "ffmpeg",
+		"progress": 8,
+		"message":  fmt.Sprintf("Mengekstrak track audio Jepang (16kHz WAV) via FFmpeg [%s]...", rangeDesc),
+	})
+
+	tmpWav := filepath.Join(uploadsDir, fmt.Sprintf("%s.%d_%d.16k.wav", mediaFilename, startSec, durationSec))
+	defer os.Remove(tmpWav)
+
+	ffArgs := []string{"-y"}
+	if startSec > 0 {
+		ffArgs = append(ffArgs, "-ss", strconv.Itoa(startSec))
+	}
+	ffArgs = append(ffArgs, "-i", videoPath)
+	if durationSec > 0 {
+		ffArgs = append(ffArgs, "-t", strconv.Itoa(durationSec))
+	}
+	ffArgs = append(ffArgs, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", tmpWav)
+
+	cmdAudio := exec.CommandContext(ctx, "ffmpeg", ffArgs...)
+	if out, err := cmdAudio.CombinedOutput(); err != nil {
+		sendSSE(map[string]interface{}{
+			"type":    "error",
+			"message": fmt.Sprintf("FFmpeg gagal mengekstrak audio: %v (%s)", err, string(out)),
+		})
+		return
+	}
+
+	// Step 2: Run whisper_extract.py (Target ONLY Japanese speech: language="ja") and stream NDJSON lines as SSE
+	pythonBin := "/home/hideri/coding/Open-LLM-VTuber/.venv/bin/python3"
+	if _, err := os.Stat(pythonBin); err != nil {
+		pythonBin = "python3"
+	}
+	scriptPath, _ := filepath.Abs("./scripts/whisper_extract.py")
+	offsetMs := startSec * 1000
+
+	cmdWhisper := exec.CommandContext(
+		ctx,
+		pythonBin,
+		scriptPath,
+		"--input", tmpWav,
+		"--offset-ms", strconv.Itoa(offsetMs),
+	)
+
+	stdoutPipe, err := cmdWhisper.StdoutPipe()
+	if err != nil {
+		sendSSE(map[string]interface{}{
+			"type":    "error",
+			"message": "Gagal membuka pipe Faster-Whisper: " + err.Error(),
+		})
+		return
+	}
+
+	if err := cmdWhisper.Start(); err != nil {
+		sendSSE(map[string]interface{}{
+			"type":    "error",
+			"message": "Gagal menjalankan Faster-Whisper: " + err.Error(),
+		})
+		return
+	}
+
+	scanner := bufio.NewScanner(stdoutPipe)
+	buf := make([]byte, 0, 256*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			continue
+		}
+
+		evType, _ := raw["type"].(string)
+		if evType == "segment" {
+			sentence, _ := raw["sentence"].(string)
+			startMs := int64(0)
+			endMs := int64(0)
+			idx := 1
+			if v, ok := raw["start_time_ms"].(float64); ok {
+				startMs = int64(v)
+			}
+			if v, ok := raw["end_time_ms"].(float64); ok {
+				endMs = int64(v)
+			}
+			if v, ok := raw["index"].(float64); ok {
+				idx = int(v)
+			}
+
+			// Match Japanese sentence against OpenJLPT N4/N3 SQLite database in real-time (<0.5ms)
+			matched, n4n3Count, coverage := h.MiningUC.MatchSentenceVocab(sentence)
+			clipURL := fmt.Sprintf(
+				"/api/v1/mining/clip?media=%s&start_ms=%d&end_ms=%d",
+				url.QueryEscape(mediaFilename),
+				startMs,
+				endMs,
+			)
+			cue := domain.MediaCue{
+				Index:          idx,
+				StartTimeMs:    startMs,
+				EndTimeMs:      endMs,
+				TimestampLabel: h.MiningUC.FormatTimestampRange(startMs, endMs),
+				Sentence:       sentence,
+				ClipAudioURL:   clipURL,
+				MatchedVocab:   matched,
+				N4N3Count:      n4n3Count,
+				CoverageRate:   coverage,
+			}
+			raw["cue"] = cue
+		}
+
+		sendSSE(raw)
+	}
+
+	_ = cmdWhisper.Wait()
 }
 
 // ExtractUploadedVideo handles video file upload (.mp4, .mkv, .webm, .mov, .mp3, .wav),

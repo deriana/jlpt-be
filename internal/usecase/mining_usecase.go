@@ -611,6 +611,10 @@ func hmsToMs(hStr, mStr, sStr, msStr string) int64 {
 	return ((h*3600 + m*60 + s) * 1000) + ms
 }
 
+func (u *MiningUsecase) FormatTimestampRange(startMs, endMs int64) string {
+	return fmt.Sprintf("%s - %s", msToClock(startMs), msToClock(endMs))
+}
+
 func msToClock(ms int64) string {
 	if ms < 0 {
 		ms = 0
