@@ -3,23 +3,72 @@ package sqlite
 import (
 	"database/sql"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"sync"
 
 	"jlptmaster/backend/internal/domain"
 )
 
+var noisyJMDictMetaRegex = regexp.MustCompile(`(?i)\((female|male|fem|masc|humble|honorable|respectful|polite|informal|familiar|archaic|obsolete|abbreviated|abbreviation|colloquial|slang|vulgar|derogatory|poetic|uk|id|usually written using kana alone|used by [^)]+|used for [^)]+|used in [^)]+|used with [^)]+|not used for [^)]+|daytime greeting[^)]*|of three or more|of an animal|of birds|faster than[^)]*|stopping at[^)]*)\)`)
+
+var curatedCommonSenseMeanings = map[string][]string{
+	"まあ":   {"well; I think; my!", "yah; lumayan; tenang saja"},
+	"兼ねて":  {"at the same time; also serving as", "sekalian; sekaligus (merangkap)"},
+	"兼ねる":  {"to serve as both; to combine", "merangkap; sekaligus sebagai"},
+	"詫び":   {"apology; excuse", "permintaan maaf; maaf"},
+	"お詫び":  {"apology", "permintaan maaf; maaf"},
+	"詫びる":  {"to apologize", "meminta maaf"},
+	"上着":   {"jacket; coat; outerwear", "jaket; pakaian luar"},
+	"勝手":   {"one's own way; without permission", "seenaknya; tanpa izin"},
+	"やっぱり": {"as expected; after all", "ternyata memang; seperti dugaanku"},
+	"やっぱ":  {"as expected; after all", "ternyata memang; seperti dugaanku"},
+	"いっぱい": {"full; a lot; many", "banyak; penuh"},
+}
+
+// CleanDictionaryMeanings strips confusing raw JMdict metadata tags like "(female)", "(humble)", "(archaic)"
+// and prioritizes the top 2-3 most relevant, concise definitions.
+func CleanDictionaryMeanings(word string, rawMeanings []string) []string {
+	if curated, ok := curatedCommonSenseMeanings[word]; ok {
+		return curated
+	}
+	var cleaned []string
+	seen := make(map[string]bool)
+	for _, m := range rawMeanings {
+		c := noisyJMDictMetaRegex.ReplaceAllString(m, "")
+		c = strings.TrimSpace(strings.Join(strings.Fields(c), " "))
+		c = strings.Trim(c, ";, ")
+		if c == "" {
+			continue
+		}
+		lower := strings.ToLower(c)
+		if !seen[lower] {
+			seen[lower] = true
+			cleaned = append(cleaned, c)
+		}
+		if len(cleaned) >= 3 {
+			break
+		}
+	}
+	if len(cleaned) == 0 && len(rawMeanings) > 0 {
+		return rawMeanings[:1]
+	}
+	return cleaned
+}
+
 type JLPTRepository struct {
-	DB          *sql.DB
-	mu          sync.RWMutex
-	vocabIndex  map[string]domain.VocabItem
-	indexLoaded bool
+	DB           *sql.DB
+	mu           sync.RWMutex
+	vocabIndex   map[string]domain.VocabItem
+	readingIndex map[string]domain.VocabItem
+	indexLoaded  bool
 }
 
 func NewJLPTRepository(db *sql.DB) *JLPTRepository {
 	return &JLPTRepository{
-		DB:         db,
-		vocabIndex: make(map[string]domain.VocabItem),
+		DB:           db,
+		vocabIndex:   make(map[string]domain.VocabItem),
+		readingIndex: make(map[string]domain.VocabItem),
 	}
 }
 
@@ -81,6 +130,7 @@ func (r *JLPTRepository) SearchVocab(userID int64, level string, query string, s
 			_ = json.Unmarshal([]byte(meaningsJSON), &item.Meanings)
 			_ = json.Unmarshal([]byte(posJSON), &item.POS)
 			_ = json.Unmarshal([]byte(examplesJSON), &item.Examples)
+			item.Meanings = CleanDictionaryMeanings(item.Word, item.Meanings)
 			items = append(items, item)
 		}
 	}
@@ -230,12 +280,14 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 	defer rows.Close()
 
 	idx := make(map[string]domain.VocabItem, 12000)
+	readIdx := make(map[string]domain.VocabItem, 12000)
 	for rows.Next() {
 		var item domain.VocabItem
 		var meanJSON, posJSON, otherJSON string
 		if err := rows.Scan(&item.ID, &item.Word, &item.Reading, &item.Romaji, &meanJSON, &item.Level, &posJSON, &otherJSON); err == nil {
 			_ = json.Unmarshal([]byte(meanJSON), &item.Meanings)
 			_ = json.Unmarshal([]byte(posJSON), &item.POS)
+			item.Meanings = CleanDictionaryMeanings(item.Word, item.Meanings)
 
 			// Only index terms with >= 2 runes OR kanji characters to avoid single-kana particle noise
 			runes := []rune(item.Word)
@@ -247,6 +299,17 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 					idx[item.Word] = item
 				}
 			}
+
+			// Index by Hiragana reading (readingIndex) so Hiragana words in transcripts (e.g. おわび -> お詫び/詫び, うわぎ -> 上着) match Kanji dictionary entries
+			readRunes := []rune(item.Reading)
+			if len(readRunes) >= 2 {
+				if item.Word == "今日" && item.Reading == "きょう" {
+					readIdx[item.Reading] = item
+				} else if _, exists := readIdx[item.Reading]; !exists {
+					readIdx[item.Reading] = item
+				}
+			}
+
 			// Index verb/adjective stem ONLY when the trailing character is Hiragana okurigana (e.g. 短い -> 短, 諦める -> 諦め)
 			// NEVER drop a Kanji character from a 2-Kanji compound noun (which previously caused 会 to match 会議 or 前 to match 前者!)
 			if len(runes) >= 2 && isKanjiRune(runes[0]) && isHiraganaRune(runes[len(runes)-1]) {
@@ -261,14 +324,77 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 		}
 	}
 
-	// Ensure high-frequency school/anime compounds (広報 = Humas, 生徒会 = OSIS, 浮気相手 = pasangan selingkuh, etc.) are indexed
+	// Ensure high-frequency school/anime compounds & honorific forms (お詫び, 兼ねて, 広報, 生徒会, 浮気相手, etc.) are indexed
 	animeExtras := []domain.VocabItem{
+		{
+			ID:       "custom-owabi",
+			Word:     "お詫び",
+			Reading:  "おわび",
+			Romaji:   "owabi",
+			Meanings: []string{"permintaan maaf; maaf", "apology"},
+			Level:    "N3",
+			POS:      []string{"n", "vs"},
+		},
+		{
+			ID:       "custom-wabi",
+			Word:     "詫び",
+			Reading:  "わび",
+			Romaji:   "wabi",
+			Meanings: []string{"permintaan maaf; maaf", "apology"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-kanete",
+			Word:     "兼ねて",
+			Reading:  "かねて",
+			Romaji:   "kanete",
+			Meanings: []string{"sekalian; sekaligus (merangkap)", "at the same time; also serving as"},
+			Level:    "N3",
+			POS:      []string{"adv"},
+		},
+		{
+			ID:       "custom-maa",
+			Word:     "まあ",
+			Reading:  "まあ",
+			Romaji:   "maa",
+			Meanings: []string{"yah; lumayan; tenang saja", "well; I think"},
+			Level:    "N3",
+			POS:      []string{"adv", "int"},
+		},
+		{
+			ID:       "custom-yappari",
+			Word:     "やっぱり",
+			Reading:  "やっぱり",
+			Romaji:   "yappari",
+			Meanings: []string{"ternyata memang; seperti dugaanku", "as expected; after all"},
+			Level:    "N4",
+			POS:      []string{"adv"},
+		},
+		{
+			ID:       "custom-uwagi",
+			Word:     "上着",
+			Reading:  "うわぎ",
+			Romaji:   "uwagi",
+			Meanings: []string{"jaket; pakaian luar", "jacket; coat; outerwear"},
+			Level:    "N4",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-katte",
+			Word:     "勝手",
+			Reading:  "かって",
+			Romaji:   "katte",
+			Meanings: []string{"seenaknya; tanpa izin", "one's own way; without permission"},
+			Level:    "N3",
+			POS:      []string{"n", "adj-na"},
+		},
 		{
 			ID:       "custom-kouhou",
 			Word:     "広報",
 			Reading:  "こうほう",
 			Romaji:   "kouhou",
-			Meanings: []string{"humas (hubungan masyarakat)", "public relations", "publisitas"},
+			Meanings: []string{"humas (hubungan masyarakat)", "public relations"},
 			Level:    "N3",
 			POS:      []string{"n", "vs"},
 		},
@@ -286,7 +412,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "張り替える",
 			Reading:  "はりかえる",
 			Romaji:   "harikaeru",
-			Meanings: []string{"mengganti tempelan", "menempel ulang", "to re-paste"},
+			Meanings: []string{"mengganti tempelan; menempel ulang", "to re-paste"},
 			Level:    "N3",
 			POS:      []string{"v1", "vt"},
 		},
@@ -304,7 +430,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "浮気",
 			Reading:  "うわき",
 			Romaji:   "uwaki",
-			Meanings: []string{"selingkuh", "perselingkuhan", "cheating / affair"},
+			Meanings: []string{"selingkuh; perselingkuhan", "cheating; affair"},
 			Level:    "N3",
 			POS:      []string{"n", "vs"},
 		},
@@ -313,7 +439,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "浮気相手",
 			Reading:  "うわきあいて",
 			Romaji:   "uwaki aite",
-			Meanings: []string{"pasangan selingkuh", "selingkuhan", "affair partner"},
+			Meanings: []string{"pasangan selingkuh; selingkuhan", "affair partner"},
 			Level:    "N3",
 			POS:      []string{"n"},
 		},
@@ -322,7 +448,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "用済み",
 			Reading:  "ようずみ",
 			Romaji:   "youzumi",
-			Meanings: []string{"sudah tidak berguna lagi", "urusan selesai", "having no further use"},
+			Meanings: []string{"sudah tidak berguna lagi; urusan selesai", "having no further use"},
 			Level:    "N3",
 			POS:      []string{"n"},
 		},
@@ -340,7 +466,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "婚約者",
 			Reading:  "こんやくしゃ",
 			Romaji:   "konyakusha",
-			Meanings: []string{"tunangan", "fiance / fiancee"},
+			Meanings: []string{"tunangan", "fiance; fiancee"},
 			Level:    "N3",
 			POS:      []string{"n"},
 		},
@@ -358,7 +484,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "書記",
 			Reading:  "しょき",
 			Romaji:   "shoki",
-			Meanings: []string{"sekretaris", "secretary / clerk"},
+			Meanings: []string{"sekretaris", "secretary; clerk"},
 			Level:    "N3",
 			POS:      []string{"n"},
 		},
@@ -367,19 +493,32 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Word:     "勘違い",
 			Reading:  "かんちがい",
 			Romaji:   "kanchigai",
-			Meanings: []string{"salah paham", "salah sangka", "misunderstanding"},
+			Meanings: []string{"salah paham; salah sangka", "misunderstanding"},
 			Level:    "N3",
 			POS:      []string{"n", "vs"},
 		},
 	}
 	for _, ex := range animeExtras {
 		idx[ex.Word] = ex
+		readIdx[ex.Reading] = ex
 	}
-	idx["コウホー"] = animeExtras[0]
+	idx["コウホー"] = animeExtras[7]
+	idx["やっぱ"] = animeExtras[4]
+	readIdx["やっぱ"] = animeExtras[4]
 
 	r.vocabIndex = idx
+	r.readingIndex = readIdx
 	r.indexLoaded = true
 	return r.vocabIndex, nil
+}
+
+func (r *JLPTRepository) GetVocabReadingIndex() (map[string]domain.VocabItem, error) {
+	if _, err := r.GetVocabMatcherIndex(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readingIndex, nil
 }
 
 func isKanjiRune(ch rune) bool {

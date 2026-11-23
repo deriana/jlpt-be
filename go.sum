@@ -30,6 +30,14 @@ github.com/goccy/go-yaml v1.19.2/go.mod h1:XBurs7gK8ATbW4ZPGKgcbrY1Br56PdM69F7Lk
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+github.com/ikawaha/kagome-dict v1.1.8 h1:AG6BevQzDaGrALlRo/KfpeXW5cbLr6sQ03ByOv7tEks=
+github.com/ikawaha/kagome-dict v1.1.8/go.mod h1:Hu5a23IqJLVTpapZSlHQQZdBeTtdFJMjk7ef8Mjgn4U=
+github.com/ikawaha/kagome-dict/ipa v1.2.7 h1:DSUP4YrGu6Ork+6/dvbdrkhrQEWniFk5TrZ+v1JG9NI=
+github.com/ikawaha/kagome-dict/ipa v1.2.7/go.mod h1:tqsL6U0gl7DPRpIljlHnnugojzHNOBgh6GnFuNju+6g=
+github.com/ikawaha/kagome-dict/uni v1.2.6 h1:q5AzlkZ0bFAUmX5EKN/hfb5Ze39pJHyZm+65seQFjdM=
+github.com/ikawaha/kagome-dict/uni v1.2.6/go.mod h1:YKr6RV/SKGoEHl4pcxzFnsVemRpRISwgTpSZqqwZbKs=
+github.com/ikawaha/kagome/v2 v2.11.1 h1:7NQ2QyzNcbKD3/3EVA959fcvo1PhXx8CpUChqjYmi0Y=
+github.com/ikawaha/kagome/v2 v2.11.1/go.mod h1:6mYPezBou+iNVnX9uNa00Sfu6S6t2zcM8Nv1EW9Y9so=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=

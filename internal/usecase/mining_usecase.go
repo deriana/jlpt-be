@@ -13,6 +13,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/ikawaha/kagome-dict/ipa"
+	"github.com/ikawaha/kagome/v2/tokenizer"
 
 	"jlptmaster/backend/internal/domain"
 	"jlptmaster/backend/internal/repository/sqlite"
@@ -32,67 +36,332 @@ func NewMiningUsecase(miningRepo *sqlite.MiningRepository, srsRepo *sqlite.SRSRe
 	}
 }
 
-// MatchSentenceVocab runs longest-match Japanese tokenization against the SQLite OpenJLPT index,
-// automatically highlighting and defining JLPT N4 and N3 (plus N5/N2/N1) vocabulary in the sentence.
+var (
+	jpMorphTokenizerOnce sync.Once
+	jpMorphTokenizer     *tokenizer.Tokenizer
+)
+
+func getMorphTokenizer() *tokenizer.Tokenizer {
+	jpMorphTokenizerOnce.Do(func() {
+		t, err := tokenizer.New(ipa.Dict(), tokenizer.OmitBosEos())
+		if err == nil {
+			jpMorphTokenizer = t
+		}
+	})
+	return jpMorphTokenizer
+}
+
+func katakanaToHiragana(s string) string {
+	var out []rune
+	for _, r := range s {
+		if r >= 0x30A1 && r <= 0x30F6 {
+			out = append(out, r-0x60)
+		} else {
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+func hasKanjiRune(s string) bool {
+	for _, r := range s {
+		if (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF) {
+			return true
+		}
+	}
+	return false
+}
+
+// ignoredStopWords excludes grammatical filler tokens, bound formal nouns, and single-kana noise
+var ignoredStopWords = map[string]bool{
+	"こと": true, "もの": true, "とこ": true, "よう": true,
+	"あっ": true, "えー": true, "あー": true, "うん": true,
+	"はい": true, "ええ": true, "おい": true, "ねえ": true,
+	"てる": true, "いる": true, "ある": true, "なる": true,
+	"する": true, "やる": true, "くる": true, "いく": true,
+}
+
+type morphTokenInfo struct {
+	Surface  string
+	BaseForm string
+	Reading  string
+	POS0     string
+	POS1     string
+	StartPos int
+	EndPos   int
+}
+
+// MatchSentenceVocab runs IPADIC morphological tokenization (equivalent to Kuromoji) with:
+// 1. Honorific prefix merging ("お" / "ご" + noun/verb -> "おわび" / "お詫び") and compound noun/lexicalized verb+te merging ("浮気" + "相手" -> "浮気相手", "兼ね" + "て" -> "兼ねて").
+// 2. Dual lookup by basic_form / expression AND Hiragana reading (so Hiragana "おわび" matches Kanji "お詫び" or "詫び"), while preserving surface_form on the UI badge.
+// 3. Strict filtering of particles (助詞), pure auxiliary verbs (助動詞), punctuation (記号), and bound grammatical tokens (非自立).
 func (u *MiningUsecase) MatchSentenceVocab(sentence string) ([]domain.MatchedVocabToken, int, float64) {
-	idx, err := u.JLPTRepo.GetVocabMatcherIndex()
-	if err != nil || len(idx) == 0 {
+	exprIdx, err := u.JLPTRepo.GetVocabMatcherIndex()
+	if err != nil || len(exprIdx) == 0 {
 		return []domain.MatchedVocabToken{}, 0, 0
 	}
+	readIdx, _ := u.JLPTRepo.GetVocabReadingIndex()
 
-	runes := []rune(sentence)
-	n := len(runes)
-	var matches []domain.MatchedVocabToken
-	seenWords := make(map[string]bool)
-	matchedRunes := 0
 	totalContentRunes := 0
-
-	for _, r := range runes {
+	for _, r := range sentence {
 		if !isPunctuationOrSpace(r) {
 			totalContentRunes++
 		}
 	}
 
+	tokEngine := getMorphTokenizer()
+	if tokEngine == nil {
+		return []domain.MatchedVocabToken{}, 0, 0
+	}
+
+	rawTokens := tokEngine.Tokenize(sentence)
+	var tokens []morphTokenInfo
+	runeCursor := 0
+	for _, rt := range rawTokens {
+		surf := rt.Surface
+		surfLen := len([]rune(surf))
+		pos := rt.POS()
+		pos0, pos1 := "", ""
+		if len(pos) > 0 {
+			pos0 = pos[0]
+		}
+		if len(pos) > 1 {
+			pos1 = pos[1]
+		}
+		base, ok := rt.BaseForm()
+		if !ok || base == "" || base == "*" {
+			base = surf
+		}
+		read, ok := rt.Reading()
+		if !ok || read == "" || read == "*" {
+			read = surf
+		}
+		readHira := katakanaToHiragana(read)
+
+		tokens = append(tokens, morphTokenInfo{
+			Surface:  surf,
+			BaseForm: base,
+			Reading:  readHira,
+			POS0:     pos0,
+			POS1:     pos1,
+			StartPos: runeCursor,
+			EndPos:   runeCursor + surfLen,
+		})
+		runeCursor += surfLen
+	}
+
+	lookupEntry := func(surf, base, reading string, allowReadingFallback bool) (domain.VocabItem, bool) {
+		if v, ok := exprIdx[surf]; ok {
+			return v, true
+		}
+		if base != "" && base != surf {
+			if v, ok := exprIdx[base]; ok {
+				return v, true
+			}
+		}
+		if allowReadingFallback && readIdx != nil {
+			// When token in sentence is written in Hiragana (e.g. おわび, わび, うわぎ, かねて), match by reading column
+			if !hasKanjiRune(surf) && len([]rune(surf)) >= 2 {
+				if v, ok := readIdx[surf]; ok {
+					return v, true
+				}
+			}
+			if !hasKanjiRune(base) && len([]rune(base)) >= 2 {
+				if v, ok := readIdx[base]; ok {
+					return v, true
+				}
+			}
+			if reading != "" && !hasKanjiRune(surf) && len([]rune(reading)) >= 2 {
+				if v, ok := readIdx[reading]; ok {
+					return v, true
+				}
+			}
+		}
+		return domain.VocabItem{}, false
+	}
+
+	var matches []domain.MatchedVocabToken
+	seenWords := make(map[string]bool)
+	matchedRunes := 0
+
 	i := 0
+	n := len(tokens)
 	for i < n {
-		if isPunctuationOrSpace(runes[i]) {
+		tk := tokens[i]
+
+		// Skip punctuation, whitespace, particles (助詞), and pure auxiliary verbs (助動詞)
+		if isPunctuationOrSpace([]rune(tk.Surface)[0]) || tk.POS0 == "記号" || tk.POS0 == "補助記号" || tk.POS0 == "助詞" || tk.POS0 == "助動詞" {
 			i++
 			continue
 		}
 
-		matched := false
-		maxLen := 8
-		if i+maxLen > n {
-			maxLen = n - i
-		}
+		// 1. Honorific Prefix Merging: "お" / "ご" / "御" (接頭詞) + Next Noun/Verb (e.g. "お" + "わび" -> "おわび" -> "お詫び" / "詫び")
+		if (tk.POS0 == "接頭詞" || tk.Surface == "お" || tk.Surface == "ご" || tk.Surface == "御") && i+1 < n {
+			nextTk := tokens[i+1]
+			if nextTk.POS0 == "名詞" || nextTk.POS0 == "動詞" || nextTk.POS0 == "形容詞" {
+				mergedSurf := tk.Surface + nextTk.Surface
+				mergedBase := tk.Surface + nextTk.BaseForm
+				mergedRead := katakanaToHiragana(tk.Reading) + nextTk.Reading
 
-		for l := maxLen; l >= 1; l-- {
-			sub := string(runes[i : i+l])
-			if v, ok := idx[sub]; ok {
-				if !seenWords[v.Word] {
-					seenWords[v.Word] = true
-					matches = append(matches, domain.MatchedVocabToken{
-						VocabID:  v.ID,
-						Surface:  sub,
-						Word:     v.Word,
-						Reading:  v.Reading,
-						Romaji:   v.Romaji,
-						Meanings: v.Meanings,
-						Level:    v.Level,
-						POS:      v.POS,
-						StartIdx: i,
-						EndIdx:   i + l,
-					})
+				// Also check if an additional suffix token follows (e.g., お + 姉 + さん -> お姉さん, お + 嬢 + 様 -> お嬢様)
+				if i+2 < n && (tokens[i+2].POS1 == "接尾" || tokens[i+2].Surface == "さん" || tokens[i+2].Surface == "様" || tokens[i+2].Surface == "さま") {
+					triSurf := mergedSurf + tokens[i+2].Surface
+					triBase := mergedBase + tokens[i+2].BaseForm
+					triRead := mergedRead + tokens[i+2].Reading
+					if v, ok := lookupEntry(triSurf, triBase, triRead, true); ok {
+						if !seenWords[v.Word] {
+							seenWords[v.Word] = true
+							matches = append(matches, domain.MatchedVocabToken{
+								VocabID:  v.ID,
+								Surface:  triSurf,
+								Word:     v.Word,
+								Reading:  v.Reading,
+								Romaji:   v.Romaji,
+								Meanings: sqlite.CleanDictionaryMeanings(v.Word, v.Meanings),
+								Level:    v.Level,
+								POS:      v.POS,
+								StartIdx: tk.StartPos,
+								EndIdx:   tokens[i+2].EndPos,
+							})
+						}
+						matchedRunes += len([]rune(triSurf))
+						i += 3
+						continue
+					}
 				}
-				matchedRunes += l
-				i += l
-				matched = true
-				break
+
+				// Try merged "おわび" / "お詫び" first; if not found, fallback to base noun/verb "わび" / "詫び"
+				if v, ok := lookupEntry(mergedSurf, mergedBase, mergedRead, true); ok {
+					if !seenWords[v.Word] {
+						seenWords[v.Word] = true
+						matches = append(matches, domain.MatchedVocabToken{
+							VocabID:  v.ID,
+							Surface:  mergedSurf,
+							Word:     v.Word,
+							Reading:  v.Reading,
+							Romaji:   v.Romaji,
+							Meanings: sqlite.CleanDictionaryMeanings(v.Word, v.Meanings),
+							Level:    v.Level,
+							POS:      v.POS,
+							StartIdx: tk.StartPos,
+							EndIdx:   nextTk.EndPos,
+						})
+					}
+					matchedRunes += len([]rune(mergedSurf))
+					i += 2
+					continue
+				}
+				if v, ok := lookupEntry(nextTk.Surface, nextTk.BaseForm, nextTk.Reading, true); ok {
+					if !seenWords[v.Word] {
+						seenWords[v.Word] = true
+						matches = append(matches, domain.MatchedVocabToken{
+							VocabID:  v.ID,
+							Surface:  mergedSurf,
+							Word:     v.Word,
+							Reading:  v.Reading,
+							Romaji:   v.Romaji,
+							Meanings: sqlite.CleanDictionaryMeanings(v.Word, v.Meanings),
+							Level:    v.Level,
+							POS:      v.POS,
+							StartIdx: tk.StartPos,
+							EndIdx:   nextTk.EndPos,
+						})
+					}
+					matchedRunes += len([]rune(mergedSurf))
+					i += 2
+					continue
+				}
 			}
 		}
-		if !matched {
-			i++
+
+		// 2. Multi-Token Compound Merging:
+		//    - 2 Adjacent Nouns forming a compound (e.g. "浮気" + "相手" -> "浮気相手", "生徒" + "会" -> "生徒会", "広報" + "活動" -> "広報活動")
+		//    - Verb stem + "て"/"で" forming a lexicalized JLPT expression (e.g. "兼ね" + "て" -> "兼ねて")
+		if i+1 < n {
+			nextTk := tokens[i+1]
+			canCombine := (tk.POS0 == "名詞" && nextTk.POS0 == "名詞") ||
+				(tk.POS0 == "動詞" && (nextTk.Surface == "て" || nextTk.Surface == "で" || nextTk.POS0 == "動詞")) ||
+				(!hasKanjiRune(tk.Surface) && !hasKanjiRune(nextTk.Surface) && len([]rune(tk.Surface))+len([]rune(nextTk.Surface)) >= 3)
+			if canCombine {
+				combSurf := tk.Surface + nextTk.Surface
+				combBase := tk.Surface + nextTk.BaseForm
+				combRead := tk.Reading + nextTk.Reading
+				if v, ok := lookupEntry(combSurf, combBase, combRead, true); ok {
+					if !seenWords[v.Word] {
+						seenWords[v.Word] = true
+						matches = append(matches, domain.MatchedVocabToken{
+							VocabID:  v.ID,
+							Surface:  combSurf,
+							Word:     v.Word,
+							Reading:  v.Reading,
+							Romaji:   v.Romaji,
+							Meanings: sqlite.CleanDictionaryMeanings(v.Word, v.Meanings),
+							Level:    v.Level,
+							POS:      v.POS,
+							StartIdx: tk.StartPos,
+							EndIdx:   nextTk.EndPos,
+						})
+					}
+					matchedRunes += len([]rune(combSurf))
+					i += 2
+					continue
+				}
+			}
 		}
+
+		// 3. Filter irrelevant bound grammatical tokens (非自立), pronouns/suffixes, and single-kana interjections
+		if tk.POS1 == "非自立" || tk.POS1 == "接尾" || tk.POS0 == "感動詞" && len([]rune(tk.Surface)) <= 1 {
+			i++
+			continue
+		}
+		if ignoredStopWords[tk.Surface] || ignoredStopWords[tk.BaseForm] {
+			i++
+			continue
+		}
+		// Ignore single-character Hiragana tokens that are not Kanji
+		if !hasKanjiRune(tk.Surface) && len([]rune(tk.Surface)) < 2 {
+			i++
+			continue
+		}
+
+		// 4. Single Content Word Lookup (using basic_form & reading fallback, displaying conjugated surface_form)
+		displaySurf := tk.Surface
+		endPos := tk.EndPos
+		consumeCount := 1
+		// Attach trailing okurigana/conjugation auxiliary for verbs/adjectives so surface badge reflects actual word form in sentence
+		if (tk.POS0 == "動詞" || tk.POS0 == "形容詞") && i+1 < n && (tokens[i+1].POS0 == "助動詞" || (tokens[i+1].POS0 == "助詞" && (tokens[i+1].Surface == "て" || tokens[i+1].Surface == "で"))) {
+			displaySurf = tk.Surface + tokens[i+1].Surface
+			endPos = tokens[i+1].EndPos
+			consumeCount = 2
+		}
+
+		if v, ok := lookupEntry(tk.Surface, tk.BaseForm, tk.Reading, true); ok {
+			// Guard against single-Kanji false matches when the Kanji reading in sentence differs from dictionary entry
+			if len([]rune(v.Word)) == 1 && hasKanjiRune(v.Word) && tk.Reading != "" && v.Reading != "" && tk.Reading != v.Reading {
+				i += consumeCount
+				continue
+			}
+			if !seenWords[v.Word] {
+				seenWords[v.Word] = true
+				matches = append(matches, domain.MatchedVocabToken{
+					VocabID:  v.ID,
+					Surface:  displaySurf,
+					Word:     v.Word,
+					Reading:  v.Reading,
+					Romaji:   v.Romaji,
+					Meanings: sqlite.CleanDictionaryMeanings(v.Word, v.Meanings),
+					Level:    v.Level,
+					POS:      v.POS,
+					StartIdx: tk.StartPos,
+					EndIdx:   endPos,
+				})
+			}
+			matchedRunes += len([]rune(displaySurf))
+			i += consumeCount
+			continue
+		}
+
+		i++
 	}
 
 	n4n3Count := 0
