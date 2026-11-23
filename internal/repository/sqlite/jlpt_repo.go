@@ -261,7 +261,7 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 		}
 	}
 
-	// Ensure high-frequency school/anime compounds (広報 = Humas, 生徒会 = OSIS, 張り替える = menempel ulang) are indexed
+	// Ensure high-frequency school/anime compounds (広報 = Humas, 生徒会 = OSIS, 浮気相手 = pasangan selingkuh, etc.) are indexed
 	animeExtras := []domain.VocabItem{
 		{
 			ID:       "custom-kouhou",
@@ -289,6 +289,87 @@ func (r *JLPTRepository) GetVocabMatcherIndex() (map[string]domain.VocabItem, er
 			Meanings: []string{"mengganti tempelan", "menempel ulang", "to re-paste"},
 			Level:    "N3",
 			POS:      []string{"v1", "vt"},
+		},
+		{
+			ID:       "custom-oneesan",
+			Word:     "お姉さん",
+			Reading:  "おねえさん",
+			Romaji:   "oneesan",
+			Meanings: []string{"kakak perempuan", "older sister"},
+			Level:    "N5",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-uwaki",
+			Word:     "浮気",
+			Reading:  "うわき",
+			Romaji:   "uwaki",
+			Meanings: []string{"selingkuh", "perselingkuhan", "cheating / affair"},
+			Level:    "N3",
+			POS:      []string{"n", "vs"},
+		},
+		{
+			ID:       "custom-uwakiaite",
+			Word:     "浮気相手",
+			Reading:  "うわきあいて",
+			Romaji:   "uwaki aite",
+			Meanings: []string{"pasangan selingkuh", "selingkuhan", "affair partner"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-youzumi",
+			Word:     "用済み",
+			Reading:  "ようずみ",
+			Romaji:   "youzumi",
+			Meanings: []string{"sudah tidak berguna lagi", "urusan selesai", "having no further use"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-konyaku",
+			Word:     "婚約",
+			Reading:  "こんやく",
+			Romaji:   "konyaku",
+			Meanings: []string{"pertunangan", "engagement"},
+			Level:    "N3",
+			POS:      []string{"n", "vs"},
+		},
+		{
+			ID:       "custom-konyakusha",
+			Word:     "婚約者",
+			Reading:  "こんやくしゃ",
+			Romaji:   "konyakusha",
+			Meanings: []string{"tunangan", "fiance / fiancee"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-shomu",
+			Word:     "庶務",
+			Reading:  "しょむ",
+			Romaji:   "shomu",
+			Meanings: []string{"urusan umum (OSIS/kantor)", "general affairs"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-shoki",
+			Word:     "書記",
+			Reading:  "しょき",
+			Romaji:   "shoki",
+			Meanings: []string{"sekretaris", "secretary / clerk"},
+			Level:    "N3",
+			POS:      []string{"n"},
+		},
+		{
+			ID:       "custom-kanchigai",
+			Word:     "勘違い",
+			Reading:  "かんちがい",
+			Romaji:   "kanchigai",
+			Meanings: []string{"salah paham", "salah sangka", "misunderstanding"},
+			Level:    "N3",
+			POS:      []string{"n", "vs"},
 		},
 	}
 	for _, ex := range animeExtras {

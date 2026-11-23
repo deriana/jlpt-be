@@ -326,6 +326,101 @@ func (u *TranslateUsecase) saveCache(lowerKey, targetID, provider string) {
 	`, lowerKey, cleanedTarget, provider)
 }
 
+var animeConversationalJAtoID = map[string]string{
+	"お、お姉さん?来てたんだ":   "Ka-Kakak perempuanmu? Apa dia sedang berkunjung?",
+	"お、お姉さん？来てたんだ":   "Ka-Kakak perempuanmu? Apa dia sedang berkunjung?",
+	"お…お姉さん?来てたんだ":   "Ka-Kakak perempuanmu? Apa dia sedang berkunjung?",
+	"お…お姉さん？来てたんだ":   "Ka-Kakak perempuanmu? Apa dia sedang berkunjung?",
+	"お…お姉さんいたんだ":     "Oh... ternyata kamu punya kakak perempuan ya.",
+	"お姉さん?":          "Ka-Kakak perempuanmu?",
+	"お姉さん？":          "Ka-Kakak perempuanmu?",
+	"カノジョ…":          "Pa... car... ku.",
+	"カノジョ":           "Pa... car... ku.",
+	"彼女…":            "Pa... car... ku.",
+	"彼女":             "Pa... car... ku.",
+	"え?":             "Eh?",
+	"え？":             "Eh?",
+	"えっ?":            "Eh?",
+	"えっ？":            "Eh?",
+	"お前が浮気相手ってことだよ":  "Dengar, itu artinya kamulah selingkuhannya.",
+	"もう用済みだからな":      "Tapi aku sudah selesai denganmu sekarang (kamu sudah tidak berguna lagi).",
+	"もう用済みだからな…":     "Tapi aku sudah selesai denganmu sekarang (kamu sudah tidak berguna lagi).",
+	"もう用済みだな":        "Kamu sudah tidak berguna lagi sekarang.",
+	"もう用済み…":         "Sudah tidak berguna lagi...",
+	"やだ!受ける!":        "Astaga! Kocak banget!",
+	"やだ！ウケる！":        "Astaga! Kocak banget!",
+	"やだ、ウケる！":        "Astaga, kocak banget!",
+	"やだ、受ける":         "Astaga, kocak banget!",
+	"お前の勘違いだよバーカ":    "Itu cuma salah pahammu, bodoh.",
+}
+
+var jaHomophoneNormalizer = []struct {
+	wrong string
+	right string
+}{
+	{"お…お姉さんってたんだ", "お、お姉さん？来てたんだ"},
+	{"お姉さんってたんだ", "お姉さんいたんだ"},
+	{"カノジオ", "カノジョ"},
+	{"彼の女", "彼女"},
+	{"うわき合いって", "浮気相手"},
+	{"浮き合いって", "浮気相手"},
+	{"浮気合いって", "浮気相手"},
+	{"上着相手", "浮気相手"},
+	{"うわきあいて", "浮気相手"},
+	{"もう様子見だけだなぁ", "もう用済みだからな"},
+	{"もう様子見だけだな", "もう用済みだからな"},
+	{"もう様子みだけだな", "もう用済みだからな"},
+	{"もう様子見たけどな", "もう用済みだからな"},
+	{"もう様子見…", "もう用済み…"},
+	{"もう様子み…", "もう用済み…"},
+	{"もう様子味", "もう用済み"},
+	{"やだ、受ける", "やだ、ウケる！"},
+	{"やだ!受ける!", "やだ、ウケる！"},
+	{"研究性感", "研究成果"},
+	{"研究の軽しも", "研究も彼氏も"},
+	{"コン役者", "婚約者"},
+	{"私の今役は", "私の婚約は"},
+	{"婚約を発揮", "婚約を破棄"},
+	{"天性してしまった", "転生してしまった"},
+	{"モバーク役礼女", "モブ悪役令嬢"},
+	{"悪役礼女", "悪役令嬢"},
+	{"王大使", "王太子"},
+	{"応対しルート", "王太子ルート"},
+	{"法律アカデミー", "王立アカデミー"},
+	{"交換度を上げて", "好感度を上げて"},
+	{"円組", "縁組"},
+	{"全ルート整発", "全ルート制覇"},
+	{"全ルート生破", "全ルート制覇"},
+	{"バーガー", "バーカ"},
+	{"バーカー", "バーカ"},
+	{"鬼もつあつかい", "お荷物扱い"},
+	{"つつましく暗します", "つつましく暮らします"},
+	{"気づつきたくない", "傷つきたくない"},
+	{"カスセキ", "化石"},
+	{"動物食物", "動物植物"},
+	{"タイコの意外が地装に", "太古の遺骸が地層に"},
+	{"ミュージアも作って", "ミュージアムも作って"},
+	{"おじわさま", "お嬢様"},
+	{"お女様", "お嬢様"},
+	{"お見前にいらっしゃい", "お見舞いにいらっしゃい"},
+	{"おなしクラス", "同じクラス"},
+	{"なくよし", "仲良し"},
+	{"急学してた", "休学してた"},
+	{"道の区", "陸奥"},
+	{"ショム", "庶務"},
+	{"うめしょき", "梅書記"},
+	{"初期ありたかった", "書記やりたかった"},
+	{"選配", "先輩"},
+	{"ふん息", "雰囲気"},
+	{"コウホー活動", "広報活動"},
+	{"コウホー", "広報"},
+	{"矢解です", "了解です"},
+	{"妖怪です", "了解です"},
+	{"スマホ乗れた", "スマホ濡れた"},
+	{"スマホ塗れた", "スマホ濡れた"},
+	{"スマホを塗れた", "スマホ濡れた"},
+}
+
 // TranslateJAtoID translates a Japanese sentence into clean Bahasa Indonesia (with SQLite caching)
 // using Google Neural Machine Translation (clients5 dict-chrome-ex) and strips any HTML/subtitle markup.
 func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
@@ -333,10 +428,12 @@ func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
 	if clean == "" {
 		return ""
 	}
-	clean = strings.ReplaceAll(clean, "コウホー活動", "広報活動")
-	clean = strings.ReplaceAll(clean, "コウホー", "広報")
-	clean = strings.ReplaceAll(clean, "矢解です", "了解です")
-	clean = strings.ReplaceAll(clean, "スマホ乗れた", "スマホ忘れた")
+	for _, pair := range jaHomophoneNormalizer {
+		clean = strings.ReplaceAll(clean, pair.wrong, pair.right)
+	}
+	if override, ok := animeConversationalJAtoID[clean]; ok {
+		return override
+	}
 
 	cacheKey := "ja:" + clean
 	u.mu.RLock()

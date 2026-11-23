@@ -13,17 +13,71 @@ import re
 import sys
 from faster_whisper import WhisperModel
 
-DEFAULT_MODEL_PATH = "/home/hideri/coding/Open-LLM-VTuber/models/whisper_base"
+DEFAULT_MODEL_PATH = "/home/hideri/coding/Open-LLM-VTuber/models/whisper_small"
+FALLBACK_MODEL_PATH = "/home/hideri/coding/Open-LLM-VTuber/models/whisper_base"
 JP_CHAR_REGEX = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]")
 
-# Contextual prompt guides Whisper to prefer standard Japanese Kanji (広報, 生徒会, 了解, 先輩, etc.)
+# Contextual prompt guides Whisper to prefer standard Japanese Kanji across school, romance, fantasy, and slice-of-life anime
 ANIME_INITIAL_PROMPT = (
-    "日本のアニメの日常会話字幕。生徒会、広報活動、広報、ポスター、張り替える、肝心の、先輩、後輩、"
-    "了解です、さっき、今起きたって連絡が、やっぱスマホ忘れたかも、スマホ濡れたかも、今日のお詫びも兼ねて、"
-    "本当に、大丈夫、ありがとう。"
+    "日本のアニメの日常会話字幕。生徒会、広報活動、広報、庶務、書記、先輩、後輩、休学、仲良し、同じクラス、雰囲気、"
+    "お姉さん、来てたんだ、彼女、浮気相手、用済み、研究成果、勘違い、お嬢様、婚約者、婚約破棄、悪役令嬢、王太子、転生、"
+    "化石、太古の遺骸、地層、お荷物扱い、スマホ濡れたかも、今日のお詫びも兼ねて、了解です。"
 )
 
 HOMOPHONE_CORRECTIONS = [
+    ("お…お姉さんってたんだ", "お、お姉さん？来てたんだ"),
+    ("お姉さんってたんだ", "お姉さんいたんだ"),
+    ("カノジオ", "カノジョ"),
+    ("かのじお", "彼女"),
+    ("うわき合いって", "浮気相手"),
+    ("浮き合いって", "浮気相手"),
+    ("浮気合いって", "浮気相手"),
+    ("うわきあいて", "浮気相手"),
+    ("もう様子見だけだなぁ", "もう用済みだからな"),
+    ("もう様子見だけだな", "もう用済みだからな"),
+    ("もう様子みだけだな", "もう用済みだからな"),
+    ("もう様子見…", "もう用済み…"),
+    ("もう様子み…", "もう用済み…"),
+    ("もう様子味", "もう用済み"),
+    ("彼の女", "彼女"),
+    ("研究性感", "研究成果"),
+    ("研究の軽しも", "研究も彼氏も"),
+    ("コン役者", "婚約者"),
+    ("私の今役は", "私の婚約は"),
+    ("婚約を発揮", "婚約を破棄"),
+    ("天性してしまった", "転生してしまった"),
+    ("モバーク役礼女", "モブ悪役令嬢"),
+    ("悪役礼女", "悪役令嬢"),
+    ("王大使", "王太子"),
+    ("応対しルート", "王太子ルート"),
+    ("法律アカデミー", "王立アカデミー"),
+    ("交換度を上げて", "好感度を上げて"),
+    ("円組", "縁組"),
+    ("全ルート整発", "全ルート制覇"),
+    ("全ルート生破", "全ルート制覇"),
+    ("ほ…ほよしど君を?", "林田君は？"),
+    ("バーガー", "バーカ"),
+    ("バーカー", "バーカ"),
+    ("大司急医療手を呼んでまわります", "大至急医療班を呼んでまいります"),
+    ("鬼もつあつかい", "お荷物扱い"),
+    ("つつましく暗します", "つつましく暮らします"),
+    ("気づつきたくない", "傷つきたくない"),
+    ("カスセキ", "化石"),
+    ("動物食物", "動物植物"),
+    ("タイコの意外が地装に", "太古の遺骸が地層に"),
+    ("ミュージアも作って", "ミュージアムも作って"),
+    ("おじわさま", "お嬢様"),
+    ("お女様", "お嬢様"),
+    ("お見前にいらっしゃい", "お見舞いにいらっしゃい"),
+    ("おなしクラス", "同じクラス"),
+    ("なくよし", "仲良し"),
+    ("急学してた", "休学してた"),
+    ("道の区", "陸奥"),
+    ("ショム", "庶務"),
+    ("うめしょき", "梅書記"),
+    ("初期ありたかった", "書記やりたかった"),
+    ("選配", "先輩"),
+    ("ふん息", "雰囲気"),
     ("コウホー活動", "広報活動"),
     ("コウホー", "広報"),
     ("こうほう活動", "広報活動"),
@@ -43,8 +97,18 @@ HOMOPHONE_CORRECTIONS = [
 ]
 
 
+HOMOPHONE_REGEX_CORRECTIONS = [
+    (re.compile(r"(うわき|浮き|浮気|上着)(合いって|合いて|相手|あいて)"), "浮気相手"),
+    (re.compile(r"もう(様子見|様子み|様子味)(だけだなぁ|だけだな|たけどな|だな|だからな)?"), "もう用済みだからな"),
+    (re.compile(r"やだ[、！!\s]*(受ける|うける)[！!]?"), "やだ、ウケる！"),
+    (re.compile(r"お[…、\s]*お姉さん[?？]?\s*(ってたんだ|来たんだ|きてたんだ|来てたんだ)"), "お、お姉さん？来てたんだ"),
+]
+
+
 def normalize_japanese_transcript(text: str) -> str:
     cleaned = text.strip()
+    for pattern, repl in HOMOPHONE_REGEX_CORRECTIONS:
+        cleaned = pattern.sub(repl, cleaned)
     for wrong, right in HOMOPHONE_CORRECTIONS:
         cleaned = cleaned.replace(wrong, right)
     return cleaned
@@ -52,13 +116,19 @@ def normalize_japanese_transcript(text: str) -> str:
 
 def split_into_sentences_with_timestamps(text: str, start_sec: float, end_sec: float):
     """
-    If a Whisper segment spans multiple sentences separated by 。 / ？ / ！ / ? / !,
+    If a LONG Whisper segment (>= 20 chars and >= 4.0s) spans multiple distinct sentences separated by 。 / ？ / ！,
     splits them into individual sentence cues with proportional timestamps.
+    Short single-breath utterances like "お、お姉さん？来てたんだ" are kept intact as a single sentence.
     """
-    parts = re.split(r"(?<=[。？！?!])\s*", text.strip())
+    stripped = text.strip()
+    dur = end_sec - start_sec
+    if len(stripped) < 20 or dur < 4.0:
+        return [(stripped, start_sec, end_sec)]
+
+    parts = re.split(r"(?<=[。？！?!])\s*", stripped)
     sentences = [p.strip() for p in parts if p and p.strip() and JP_CHAR_REGEX.search(p)]
-    if len(sentences) <= 1:
-        return [(text.strip(), start_sec, end_sec)]
+    if len(sentences) <= 1 or any(len(s) < 6 for s in sentences):
+        return [(stripped, start_sec, end_sec)]
 
     total_chars = sum(len(s) for s in sentences)
     if total_chars <= 0:
@@ -112,8 +182,13 @@ def main():
         "message": "Memuat model AI Faster-Whisper Offline (Target: Bahasa Jepang / Kanji Kontekstual)...",
     })
 
-    model_dir = args.model if os.path.exists(args.model) else "base"
-    model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=4)
+    if os.path.exists(args.model):
+        model_dir = args.model
+    elif os.path.exists(FALLBACK_MODEL_PATH):
+        model_dir = FALLBACK_MODEL_PATH
+    else:
+        model_dir = "small"
+    model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=8)
 
     emit({
         "type": "status",
@@ -126,17 +201,8 @@ def main():
         args.input,
         language="ja",
         task="transcribe",
-        initial_prompt=ANIME_INITIAL_PROMPT,
         vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=250,
-            speech_pad_ms=180,
-            max_speech_duration_s=5.5,
-        ),
         beam_size=2,
-        best_of=1,
-        condition_on_previous_text=False,
-        temperature=0.0,
     )
 
     total_dur = max(1.0, float(info.duration or 1.0))
