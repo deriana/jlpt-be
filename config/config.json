@@ -1,0 +1,52 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8090
+  },
+  "database": {
+    "sqlite_path": "./data/jlptmaster.db",
+    "openjlpt_sqlite_path": "./data/openjlpt/openjlpt.sqlite",
+    "openjlpt_json_dir": "./data/openjlpt/json"
+  },
+  "tts": {
+    "provider": "voicevox",
+    "voicevox_url": "http://127.0.0.1:50021",
+    "default_speaker_id": "3",
+    "speed_scale": 1.0,
+    "pitch_scale": 0.0,
+    "intonation_scale": 1.0,
+    "cache_dir": "./data/audio_cache"
+  },
+  "llm": {
+    "provider": "ollama",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "api_key": "ollama",
+    "model": "qwen2.5:3b",
+    "temperature": 0.7,
+    "sensei_name": "Ryza-sensei",
+    "archetype": "tsundere"
+  },
+  "live2d": {
+    "active_model": "mao_pro",
+    "models": [
+      {
+        "id": "mao_pro",
+        "name": "Mao Pro (Sensei)",
+        "path": "/live2d-models/mao_pro/runtime/mao_pro.model3.json",
+        "scale": 0.14
+      },
+      {
+        "id": "shiroko",
+        "name": "Sunaookami Shiroko",
+        "path": "/live2d-models/shiroko/shiroko.model3.json",
+        "scale": 0.24
+      },
+      {
+        "id": "shizuku",
+        "name": "Shizuku (Classic Tutor)",
+        "path": "/live2d-models/shizuku/runtime/shizuku.model3.json",
+        "scale": 0.35
+      }
+    ]
+  }
+}

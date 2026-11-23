@@ -1,0 +1,8 @@
+bin/
+jlptmaster-api
+jlptmaster-scraper
+data/audio_cache/*.wav
+data/jlptmaster.db-shm
+data/jlptmaster.db-wal
+*.log
+.DS_Store
