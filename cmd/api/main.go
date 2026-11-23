@@ -41,10 +41,11 @@ func main() {
 	miningUC := usecase.NewMiningUsecase(miningRepo, srsRepo, jlptRepo)
 	progressUC := usecase.NewProgressUsecase(db.DB)
 	ttsUC := usecase.NewTTSUsecase(cfg)
-	tutorUC := usecase.NewTutorUsecase(cfg, tutorRepo, jlptRepo, ttsUC)
+	translateUC := usecase.NewTranslateUsecase(db.DB)
+	tutorUC := usecase.NewTutorUsecase(cfg, tutorRepo, jlptRepo, ttsUC, translateUC)
 
 	// Delivery
-	handler := deliveryhttp.NewHandler(cfg, authUC, jlptUC, srsUC, miningUC, progressUC, ttsUC, tutorUC)
+	handler := deliveryhttp.NewHandler(cfg, authUC, jlptUC, srsUC, miningUC, progressUC, ttsUC, tutorUC, translateUC)
 	router := deliveryhttp.NewRouter(handler)
 
 	winIP := config.GetWindowsHostIP()

@@ -315,6 +315,7 @@ type ChatMessage struct {
 type ChatRequest struct {
 	Message   string `json:"message" binding:"required"`
 	Mode      string `json:"mode"` // "sensei", "roleplay", "grammar", "quiz"
+	Lang      string `json:"lang"` // "id", "en", "ja"
 	SpeakerID string `json:"speaker_id"`
 	WithTTS   bool   `json:"with_tts"`
 }

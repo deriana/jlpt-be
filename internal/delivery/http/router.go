@@ -59,6 +59,9 @@ func NewRouter(h *Handler) *gin.Engine {
 		api.GET("/tutor/history", h.ListChatHistory)
 		api.POST("/tutor/chat", h.SendChatMessage)
 		api.DELETE("/tutor/history", h.ClearChatHistory)
+
+		// Auto-Translate (English -> Bahasa Indonesia)
+		api.POST("/translate", h.TranslateTexts)
 	}
 
 	return r

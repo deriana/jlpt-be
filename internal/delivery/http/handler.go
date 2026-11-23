@@ -14,14 +14,15 @@ import (
 )
 
 type Handler struct {
-	Cfg        *config.AppConfig
-	AuthUC     *usecase.AuthUsecase
-	JLPTUC     *usecase.JLPTUsecase
-	SRSUC      *usecase.SRSUsecase
-	MiningUC   *usecase.MiningUsecase
-	ProgressUC *usecase.ProgressUsecase
-	TTSUC      *usecase.TTSUsecase
-	TutorUC    *usecase.TutorUsecase
+	Cfg         *config.AppConfig
+	AuthUC      *usecase.AuthUsecase
+	JLPTUC      *usecase.JLPTUsecase
+	SRSUC       *usecase.SRSUsecase
+	MiningUC    *usecase.MiningUsecase
+	ProgressUC  *usecase.ProgressUsecase
+	TTSUC       *usecase.TTSUsecase
+	TutorUC     *usecase.TutorUsecase
+	TranslateUC *usecase.TranslateUsecase
 }
 
 func NewHandler(
@@ -33,16 +34,18 @@ func NewHandler(
 	progressUC *usecase.ProgressUsecase,
 	ttsUC *usecase.TTSUsecase,
 	tutorUC *usecase.TutorUsecase,
+	translateUC *usecase.TranslateUsecase,
 ) *Handler {
 	return &Handler{
-		Cfg:        cfg,
-		AuthUC:     authUC,
-		JLPTUC:     jlptUC,
-		SRSUC:      srsUC,
-		MiningUC:   miningUC,
-		ProgressUC: progressUC,
-		TTSUC:      ttsUC,
-		TutorUC:    tutorUC,
+		Cfg:         cfg,
+		AuthUC:      authUC,
+		JLPTUC:      jlptUC,
+		SRSUC:       srsUC,
+		MiningUC:    miningUC,
+		ProgressUC:  progressUC,
+		TTSUC:       ttsUC,
+		TutorUC:     tutorUC,
+		TranslateUC: translateUC,
 	}
 }
 
@@ -547,4 +550,32 @@ func (h *Handler) ClearChatHistory(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "cleared"})
+}
+
+// ==========================================
+// 9. Auto-Translate (EN -> Bahasa Indonesia)
+// ==========================================
+
+func (h *Handler) TranslateTexts(c *gin.Context) {
+	var req struct {
+		Text        string   `json:"text"`
+		Texts       []string `json:"texts"`
+		AllowOnline bool     `json:"allow_online"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Text != "" && len(req.Texts) == 0 {
+		req.Texts = []string{req.Text}
+	}
+	translations := h.TranslateUC.TranslateBatchENtoID(req.Texts, req.AllowOnline)
+	single := ""
+	if req.Text != "" {
+		single = translations[req.Text]
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"translated":   single,
+		"translations": translations,
+	})
 }
