@@ -162,6 +162,7 @@ func (u *MiningUsecase) ParseMediaText(rawContent string, format string) []domai
 						continue
 					}
 				}
+				line = StripSubtitleMarkup(line)
 				if line != "" {
 					textLines = append(textLines, line)
 				}

@@ -7,10 +7,22 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+var htmlAndAssTagRegex = regexp.MustCompile(`(?i)<[^>]*>|\{\\[^}]*\}`)
+
+// StripSubtitleMarkup removes any dirty HTML tags (<font face="...">, <b>, <i>) or ASS override tags ({\an8})
+func StripSubtitleMarkup(s string) string {
+	cleaned := htmlAndAssTagRegex.ReplaceAllString(s, "")
+	cleaned = strings.ReplaceAll(cleaned, "&nbsp;", " ")
+	cleaned = strings.ReplaceAll(cleaned, "&quot;", "\"")
+	cleaned = strings.ReplaceAll(cleaned, "&#39;", "'")
+	return strings.TrimSpace(cleaned)
+}
 
 type TranslateUsecase struct {
 	DB       *sql.DB
@@ -173,18 +185,26 @@ func NewTranslateUsecase(db *sql.DB) *TranslateUsecase {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`)
+	// Purge any dirty crowd-TM translations containing HTML tags (<font>, <b>) or MyMemory warnings
+	_, _ = db.Exec(`
+		DELETE FROM translations_cache
+		WHERE target_id LIKE '%<%'
+		   OR target_id LIKE '%>%'
+		   OR target_id LIKE '%MYMEMORY%'
+		   OR provider LIKE '%mymemory%'
+	`)
+
 	uc := &TranslateUsecase{
 		DB:       db,
 		memCache: make(map[string]string, 1024),
 	}
-	// Preload SQLite cached translations into memory for <0.1ms lookups
 	rows, err := db.Query(`SELECT source_en, target_id FROM translations_cache`)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var src, dst string
 			if rows.Scan(&src, &dst) == nil {
-				uc.memCache[src] = dst
+				uc.memCache[src] = StripSubtitleMarkup(dst)
 			}
 		}
 	}
@@ -244,10 +264,10 @@ func (u *TranslateUsecase) TranslateENtoID(text string, allowOnline bool) string
 		return v
 	}
 
-	// 5. Optional automatic online translation (MyMemory + Google GTX fallback, cached forever in SQLite!)
+	// 5. Pure Neural Machine Translation via Google Clients5 dict-chrome-ex (no dirty HTML tags, cached forever in SQLite!)
 	if allowOnline {
-		if onlineRes, err := fetchMyMemoryTranslate(clean, "en", "id"); err == nil && onlineRes != "" {
-			u.saveCache(lower, onlineRes, "auto-mymemory")
+		if onlineRes, err := fetchGoogleClients5Translate(clean, "en", "id"); err == nil && onlineRes != "" {
+			u.saveCache(lower, onlineRes, "auto-gclients5")
 			return onlineRes
 		}
 		if onlineRes, err := fetchGoogleTranslateGTX(clean); err == nil && onlineRes != "" {
@@ -293,81 +313,91 @@ func (u *TranslateUsecase) TranslateBatchENtoID(texts []string, allowOnline bool
 }
 
 func (u *TranslateUsecase) saveCache(lowerKey, targetID, provider string) {
+	cleanedTarget := StripSubtitleMarkup(targetID)
+	if cleanedTarget == "" {
+		return
+	}
 	u.mu.Lock()
-	u.memCache[lowerKey] = targetID
+	u.memCache[lowerKey] = cleanedTarget
 	u.mu.Unlock()
 	_, _ = u.DB.Exec(`
 		INSERT OR REPLACE INTO translations_cache (source_en, target_id, provider, updated_at)
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-	`, lowerKey, targetID, provider)
+	`, lowerKey, cleanedTarget, provider)
 }
 
-// TranslateJAtoID translates a Japanese sentence into Bahasa Indonesia (with SQLite caching)
-// so that raw videos without softsubs still get accurate Indonesian subtitle translations during SSE extraction.
+// TranslateJAtoID translates a Japanese sentence into clean Bahasa Indonesia (with SQLite caching)
+// using Google Neural Machine Translation (clients5 dict-chrome-ex) and strips any HTML/subtitle markup.
 func (u *TranslateUsecase) TranslateJAtoID(jaText string) string {
-	clean := strings.TrimSpace(jaText)
+	clean := StripSubtitleMarkup(jaText)
 	if clean == "" {
 		return ""
 	}
-	// Normalize common Katakana phonetics so translators know コウホー is 広報 (Humas / Public Relations)
 	clean = strings.ReplaceAll(clean, "コウホー活動", "広報活動")
 	clean = strings.ReplaceAll(clean, "コウホー", "広報")
 	clean = strings.ReplaceAll(clean, "矢解です", "了解です")
+	clean = strings.ReplaceAll(clean, "スマホ乗れた", "スマホ忘れた")
 
 	cacheKey := "ja:" + clean
 	u.mu.RLock()
 	if cached, ok := u.memCache[cacheKey]; ok && cached != "" {
 		u.mu.RUnlock()
-		return cached
+		return StripSubtitleMarkup(cached)
 	}
 	u.mu.RUnlock()
 
-	if translated, err := fetchMyMemoryTranslate(clean, "ja", "id"); err == nil && translated != "" {
-		u.saveCache(cacheKey, translated, "auto-mymemory-ja-id")
-		return translated
+	if translated, err := fetchGoogleClients5Translate(clean, "ja", "id"); err == nil && translated != "" {
+		cleaned := StripSubtitleMarkup(translated)
+		u.saveCache(cacheKey, cleaned, "auto-gclients5-ja-id")
+		return cleaned
 	}
 	if translated, err := fetchGoogleTranslateGTXWithLang(clean, "ja", "id"); err == nil && translated != "" {
-		u.saveCache(cacheKey, translated, "auto-gtx-ja-id")
-		return translated
+		cleaned := StripSubtitleMarkup(translated)
+		u.saveCache(cacheKey, cleaned, "auto-gtx-ja-id")
+		return cleaned
 	}
 	return ""
 }
 
-func fetchMyMemoryTranslate(text, sourceLang, targetLang string) (string, error) {
+// fetchGoogleClients5Translate uses Google's dict-chrome-ex NMT endpoint which returns pure neural translations
+// without dirty crowd-TM <font> tags or MyMemory daily quota limits.
+func fetchGoogleClients5Translate(text, sourceLang, targetLang string) (string, error) {
 	client := &http.Client{Timeout: 2500 * time.Millisecond}
 	apiURL := fmt.Sprintf(
-		"https://api.mymemory.translated.net/get?q=%s&langpair=%s|%s",
-		url.QueryEscape(text),
+		"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=%s&tl=%s&q=%s",
 		url.QueryEscape(sourceLang),
 		url.QueryEscape(targetLang),
+		url.QueryEscape(text),
 	)
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JLPTMaster/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("mymemory status %d", resp.StatusCode)
+		return "", fmt.Errorf("clients5 status %d", resp.StatusCode)
 	}
-	var parsed struct {
-		ResponseData struct {
-			TranslatedText string `json:"translatedText"`
-		} `json:"responseData"`
-		ResponseStatus int `json:"responseStatus"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return "", err
 	}
-	res := strings.TrimSpace(parsed.ResponseData.TranslatedText)
-	if strings.Contains(strings.ToUpper(res), "MYMEMORY WARNING") {
-		return "", fmt.Errorf("mymemory quota warning")
+
+	var strArr []string
+	if err := json.Unmarshal(body, &strArr); err == nil && len(strArr) > 0 {
+		return StripSubtitleMarkup(strings.Join(strArr, " ")), nil
 	}
-	return res, nil
+
+	var nestedArr [][]string
+	if err := json.Unmarshal(body, &nestedArr); err == nil && len(nestedArr) > 0 && len(nestedArr[0]) > 0 {
+		return StripSubtitleMarkup(nestedArr[0][0]), nil
+	}
+
+	return "", fmt.Errorf("unexpected clients5 format")
 }
 
 func fetchGoogleTranslateGTX(text string) (string, error) {
